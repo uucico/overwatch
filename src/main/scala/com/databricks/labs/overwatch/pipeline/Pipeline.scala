@@ -8,6 +8,9 @@ import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions.{from_unixtime, lit, rank, row_number}
 
+//import io.delta.tables._
+
+import java.text.SimpleDateFormat
 import java.time._
 import java.util.Date
 
@@ -21,6 +24,7 @@ class Pipeline(_workspace: Workspace, _database: Database,
   final val database: Database = _database
   final val config: Config = _config
   private var _pipelineSnapTime: Long = _
+  private var _readOnly: Boolean = false
   lazy protected final val postProcessor = new PostProcessor()
   private val pipelineState = scala.collection.mutable.Map[Int, SimplifiedModuleStatusReport]()
   import spark.implicits._
@@ -28,6 +32,8 @@ class Pipeline(_workspace: Workspace, _database: Database,
   envInit()
 
   protected def pipeline: Pipeline = this
+
+  def getConfig: Config = this.config
 
   def getModuleState(moduleID: Int): Option[SimplifiedModuleStatusReport] = {
     pipelineState.get(moduleID)
@@ -37,9 +43,23 @@ class Pipeline(_workspace: Workspace, _database: Database,
     pipelineState
   }
 
+  def getVerbosePipelineState: Array[ModuleStatusReport] = {
+    pipelineStateTarget.asDF.as[ModuleStatusReport].collect()
+  }
+
   def updateModuleState(moduleState: SimplifiedModuleStatusReport): Unit = {
     pipelineState.put(moduleState.moduleID, moduleState)
   }
+
+  protected[overwatch] def clearPipelineState(): Unit = {
+    pipelineState.clear()
+  }
+
+  private[overwatch] def setReadOnly(): this.type = {
+    _readOnly = true
+    this
+  }
+  private[overwatch] def readOnly: Boolean = _readOnly
 
   /**
    * Getter for Pipeline Snap Time
@@ -123,7 +143,7 @@ class Pipeline(_workspace: Workspace, _database: Database,
         .coalesce(1)
 
       database.write(finalInstanceDetailsDF, BronzeTargets.cloudMachineDetail, pipelineSnapTime.asColumnTS)
-      BronzeTargets.cloudMachineDetailViewTarget.publish("*")
+      if (config.databaseName != config.consumerDatabaseName) BronzeTargets.cloudMachineDetailViewTarget.publish("*")
     }
     this
   }
@@ -168,6 +188,7 @@ class Pipeline(_workspace: Workspace, _database: Database,
    * @return
    */
   def primordialEpoch: Long = {
+
     LocalDateTime.now(systemZoneId).minusDays(derivePrimordialDaysDiff)
       .toLocalDate.atStartOfDay
       .toInstant(systemZoneOffset)
@@ -215,6 +236,7 @@ class Pipeline(_workspace: Workspace, _database: Database,
   protected val auditLogsIncrementalCols: Seq[String] = if (config.cloudProvider == "azure") Seq("timestamp", "date") else Seq("date")
 
   private[overwatch] def initiatePostProcessing(): Unit = {
+
     postProcessor.optimize()
     Helpers.fastrm(Array(
       "/tmp/overwatch/bronze/clusterEventsBatches"
@@ -309,6 +331,9 @@ object Pipeline {
 
   val systemZoneId: ZoneId = ZoneId.systemDefault()
   val systemZoneOffset: ZoneOffset = systemZoneId.getRules.getOffset(LocalDateTime.now(systemZoneId))
+  def deriveLocalDate(dtString: String, dtFormat: SimpleDateFormat): LocalDate = {
+    dtFormat.parse(dtString).toInstant.atZone((systemZoneId)).toLocalDate
+  }
 
   /**
    * Most of Overwatch uses a custom time type, "TimeTypes" which simply pre-builds the most common forms / formats

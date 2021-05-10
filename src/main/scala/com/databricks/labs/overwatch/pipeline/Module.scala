@@ -6,23 +6,27 @@ import org.apache.log4j.{Level, Logger}
 import org.apache.spark.sql.DataFrame
 
 class Module(
-              _moduleID: Int,
-              _moduleName: String,
-              pipeline: Pipeline,
-              _moduleDependencies: Array[Int]
+              val moduleId: Int,
+              val moduleName: String,
+              private[overwatch] val pipeline: Pipeline,
+              val moduleDependencies: Array[Int]
             ) {
 
   private val logger: Logger = Logger.getLogger(this.getClass)
   import pipeline.spark.implicits._
   private val config = pipeline.config
 
-
-  val moduleId: Int = _moduleID
-  val moduleName: String = _moduleName
   private var _isFirstRun: Boolean = false
-  private val moduleDependencies: Array[Int] = _moduleDependencies
 
-  private def moduleState: SimplifiedModuleStatusReport = {
+  def copy(
+            _moduleID: Int = moduleId,
+            _moduleName: String = moduleName,
+            _pipeline: Pipeline = pipeline,
+            _moduleDependencies: Array[Int] = moduleDependencies): Module = {
+    new Module(_moduleID, _moduleName, _pipeline, _moduleDependencies)
+  }
+
+  private[overwatch] def moduleState: SimplifiedModuleStatusReport = {
     if (pipeline.getModuleState(moduleId).isEmpty) {
       _isFirstRun = true
       val initialModuleState = initModuleState
@@ -48,38 +52,83 @@ class Module(
   } else Pipeline.createTimeDetail(moduleState.untilTS)
 
   /**
-   * Defines the latest timestamp to be used for a give module as a TimeType
-   *
-   * @param moduleID moduleID for which to get the until Time
+   * Disallow pipeline start time state + max days to exceed snapshot time. Keeps pipelines from running into
+   * the future.
    * @return
    */
-  def untilTime: TimeTypes = {
+  private def limitUntilTimeToSnapTime: TimeTypes = {
     val startSecondPlusMaxDays = fromTime.asLocalDateTime.plusDays(pipeline.config.maxDays)
       .atZone(Pipeline.systemZoneId).toInstant.toEpochMilli
 
     val defaultUntilSecond = pipeline.pipelineSnapTime.asUnixTimeMilli
 
     // Reduce UntilTS IF fromTime + MAX Days < pipeline Snap Time
-    val maxIndependentUntilTime = if (startSecondPlusMaxDays < defaultUntilSecond) {
+    if (startSecondPlusMaxDays < defaultUntilSecond) {
       Pipeline.createTimeDetail(startSecondPlusMaxDays)
     } else {
       Pipeline.createTimeDetail(defaultUntilSecond)
     }
-
-    if (moduleDependencies.nonEmpty && mostLaggingDependency.untilTS < maxIndependentUntilTime.asUnixTimeMilli) {
-      val msg = s"WARNING: ENDING TIMESTAMP CHANGED:\nInitial UntilTS of ${maxIndependentUntilTime.asUnixTimeMilli} " +
-        s"exceeds that of an upstream requisite module: ${mostLaggingDependency.moduleID}-${mostLaggingDependency.moduleName} " +
-        s"with untilTS of: ${mostLaggingDependency.untilTS}. Setting current module untilTS == min requisite module: " +
-        s"${mostLaggingDependency.untilTS}."
-      logger.log(Level.WARN, msg)
-      if (pipeline.config.debugFlag) println(msg)
-      Pipeline.createTimeDetail(mostLaggingDependency.untilTS)
-    } else maxIndependentUntilTime
   }
 
-  private def mostLaggingDependency: SimplifiedModuleStatusReport = {
-    moduleDependencies.map(depState => pipelineState(depState))
-      .sortBy(_.untilTS).reverse.head
+  private def limitUntilTimeToMostLaggingDependency(originalUntilTime: TimeTypes): TimeTypes = {
+    if (moduleDependencies.nonEmpty) {
+      val mostLaggingDependencyUntilTS = if (deriveMostLaggingDependency.isEmpty) {
+        // Return primordial time if upstream dependency is completely missing. This will act as place holder and keep
+        // usages of untilTime from failing until pipeline is ready to execute and is validated. The module will fail
+        // gracefully and place error in pipeline_report
+        fromTime.asUnixTimeMilli
+      } else { // all dependencies have state
+        deriveMostLaggingDependency.get.untilTS
+      }
+
+      // Check if any dependency states latest data content (untilTS state) is < this module's untilTS
+      // This check keeps a child module from getting ahead of it's parent
+      if (mostLaggingDependencyUntilTS < originalUntilTime.asUnixTimeMilli) {
+        val msg = s"WARNING: ENDING TIMESTAMP CHANGED:\nInitial UntilTS of ${originalUntilTime.asUnixTimeMilli} " +
+          s"exceeds that of an upstream requisite module. " +
+          s"with untilTS of: ${mostLaggingDependencyUntilTS}. Setting current module untilTS == min requisite module: " +
+          s"${mostLaggingDependencyUntilTS}."
+        logger.log(Level.WARN, msg)
+        if (pipeline.config.debugFlag) println(msg)
+        Pipeline.createTimeDetail(mostLaggingDependencyUntilTS)
+      } else originalUntilTime
+
+    } else originalUntilTime
+  }
+
+  private def deriveMostLaggingDependency: Option[SimplifiedModuleStatusReport] = {
+
+    val dependencyStates = moduleDependencies.map(depModID => pipelineState.get(depModID))
+    val missingModuleIds = moduleDependencies.filterNot(depModID => pipelineState.contains(depModID))
+    val modulesMissingStates = dependencyStates.filter(_.isEmpty)
+    if (modulesMissingStates.nonEmpty) {
+      val errMsg = s"Missing upstream requisite Modules (${missingModuleIds.mkString(", ")}) to execute this Module " +
+        s"$moduleId - $moduleName.\n\nThis is likely due to lacking " +
+        s"scenarios for this scope within this workspace. For example, if running the jobs scope but no jobs have " +
+        s"executed since your primordial date (i.e. ${pipeline.config.primordialDateString}), the downstream modules " +
+        s"that depend on jobs such as jobRunCostPotentialFact cannot execute as there's no data present."
+      if (pipeline.config.debugFlag) println(errMsg)
+      logger.log(Level.ERROR, errMsg)
+      None
+    } else {
+      Some(dependencyStates.map(_.get).minBy(_.untilTS))
+    }
+  }
+
+  /**
+   * Defines the latest timestamp to be used for a give module as a TimeType
+   * When pipeline is read only, module state can be read independent of upstream dependencies.
+   *
+   * @return
+   */
+  def untilTime: TimeTypes = {
+    // Reduce UntilTS IF fromTime + MAX Days < pipeline Snap Time
+    val maxIndependentUntilTime = limitUntilTimeToSnapTime
+
+    if (pipeline.readOnly) { // don't validate dependency progress when not writing data to pipeline
+      maxIndependentUntilTime
+    } else limitUntilTimeToMostLaggingDependency(maxIndependentUntilTime)
+
   }
 
   private def initModuleState: SimplifiedModuleStatusReport = {
@@ -104,14 +153,7 @@ class Module(
 
   private def finalizeModule(report: ModuleStatusReport): Unit = {
     pipeline.updateModuleState(report.simple)
-    val pipelineReportTarget = PipelineTable(
-      name = "pipeline_report",
-      keys = Array("organization_id", "Overwatch_RunID"),
-      config = config,
-      partitionBy = Array("organization_id"),
-      incrementalColumns = Array("Pipeline_SnapTS")
-    )
-    pipeline.database.write(Seq(report).toDF, pipelineReportTarget, pipeline.pipelineSnapTime.asColumnTS)
+    pipeline.database.write(Seq(report).toDF, pipeline.pipelineStateTarget, pipeline.pipelineSnapTime.asColumnTS)
   }
 
   private def fail(msg: String, rollbackStatus: String = ""): Unit = {
@@ -195,7 +237,7 @@ class Module(
     }
   }
 
-  private def validatePipelineState(): Unit = {
+  private[overwatch] def validatePipelineState(): Unit = {
 
     if (moduleDependencies.nonEmpty) { // if dependencies present
       // If earliest untilTS of dependencies < current untilTS edit current untilTS to match
@@ -227,6 +269,7 @@ class Module(
     println(debugMsg)
     logger.log(Level.INFO, debugMsg)
     try {
+      if (pipeline.readOnly) throw new ReadOnlyException(s"Pipeline is READONLY: ETL cannot execute in read only")
       validatePipelineState()
       // validation may alter state, especially time states, reInstantiate etlDefinition to ensure current state
       val etlDefinition = _etlDefinition.copy()
