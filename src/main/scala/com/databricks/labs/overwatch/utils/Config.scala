@@ -1,6 +1,7 @@
 package com.databricks.labs.overwatch.utils
 
 import com.databricks.dbutils_v1.DBUtilsHolder.dbutils
+import com.databricks.labs.overwatch.pipeline.PipelineFunctions
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.sql.Column
 import org.apache.spark.sql.functions.col
@@ -9,16 +10,15 @@ import java.util.UUID
 
 class Config() {
 
-  private final val _overwatchSchemaVersion = "0.1"
   private final val _runID = UUID.randomUUID().toString.replace("-", "")
   private final val packageVersion: String = getClass.getPackage.getImplementationVersion
   private val _isLocalTesting: Boolean = System.getenv("OVERWATCH") == "LOCAL"
-  private val _isDBConnect: Boolean = System.getenv("DBCONNECT") == "TRUE"
-  private var _isFirstRun: Boolean = false
   private var _debugFlag: Boolean = false
+  private var _overwatchSchemaVersion = "0.420"
   private var _organizationId: String = _
   private var _databaseName: String = _
   private var _databaseLocation: String = _
+  private var _etlDataPathPrefix: String = _
   private var _consumerDatabaseName: String = _
   private var _consumerDatabaseLocation: String = _
   private var _workspaceUrl: String = _
@@ -29,13 +29,18 @@ class Config() {
   private var _badRecordsPath: String = _
   private var _primordialDateString: Option[String] = None
   private var _maxDays: Int = 60
+  private var _initialWorkerCount: Int = _
+  private var _intelligentScaling: IntelligentScaling = IntelligentScaling()
   private var _passthroughLogPath: Option[String] = None
   private var _inputConfig: OverwatchParams = _
   private var _overwatchScope: Seq[OverwatchScope.Value] = OverwatchScope.values.toSeq
   private var _initialSparkConf: Map[String, String] = Map()
   private var _intialShuffleParts: Int = 200
-  private var _contractInteractiveDBUPrice: Double = 0.56
-  private var _contractAutomatedDBUPrice: Double = 0.26
+  private var _contractInteractiveDBUPrice: Double = _
+  private var _contractAutomatedDBUPrice: Double = _
+  private var _contractSQLComputeDBUPrice: Double = _
+  private var _contractJobsLightDBUPrice: Double = _
+
 
   private val logger: Logger = Logger.getLogger(this.getClass)
   /**
@@ -44,53 +49,56 @@ class Config() {
    * the getter may be obscure or more complicated.
    */
 
-  private[overwatch] def overwatchSchemaVersion: String = _overwatchSchemaVersion
+  def overwatchSchemaVersion: String = _overwatchSchemaVersion
 
-  private[overwatch] def isLocalTesting: Boolean = _isLocalTesting
+  def isLocalTesting: Boolean = _isLocalTesting
 
-  private[overwatch] def isDBConnect: Boolean = _isDBConnect
+  def debugFlag: Boolean = _debugFlag
 
-  private[overwatch] def isFirstRun: Boolean = _isFirstRun
+  def organizationId: String = _organizationId
 
-  private[overwatch] def debugFlag: Boolean = _debugFlag
+  def cloudProvider: String = _cloudProvider
 
-  private[overwatch] def organizationId: String = _organizationId
+  def initialShuffleParts: Int = _intialShuffleParts
 
-  private[overwatch] def cloudProvider: String = _cloudProvider
+  def maxDays: Int = _maxDays
 
-  private[overwatch] def initialShuffleParts: Int = _intialShuffleParts
+  def initialWorkerCount: Int = _initialWorkerCount
 
-  private[overwatch] def maxDays: Int = _maxDays
+  def databaseName: String = _databaseName
 
-  private[overwatch] def databaseName: String = _databaseName
+  def databaseLocation: String = _databaseLocation
 
-  private[overwatch] def databaseLocation: String = _databaseLocation
+  def etlDataPathPrefix: String = _etlDataPathPrefix
 
-  private[overwatch] def consumerDatabaseName: String = _consumerDatabaseName
+  def consumerDatabaseName: String = _consumerDatabaseName
 
-  private[overwatch] def consumerDatabaseLocation: String = _consumerDatabaseLocation
+  def consumerDatabaseLocation: String = _consumerDatabaseLocation
 
-  private[overwatch] def workspaceURL: String = _workspaceUrl
+  def workspaceURL: String = _workspaceUrl
 
-  private[overwatch] def apiEnv: ApiEnv = _apiEnv
+  def apiEnv: ApiEnv = _apiEnv
 
-  private[overwatch] def auditLogConfig: AuditLogConfig = _auditLogConfig
+  def auditLogConfig: AuditLogConfig = _auditLogConfig
 
-  private[overwatch] def badRecordsPath: String = _badRecordsPath
+  def badRecordsPath: String = _badRecordsPath
 
-  private[overwatch] def passthroughLogPath: Option[String] = _passthroughLogPath
+  def passthroughLogPath: Option[String] = _passthroughLogPath
 
-  private[overwatch] def inputConfig: OverwatchParams = _inputConfig
+  def inputConfig: OverwatchParams = _inputConfig
 
-  private[overwatch] def runID: String = _runID
+  def runID: String = _runID
 
-  private[overwatch] def contractInteractiveDBUPrice: Double = _contractInteractiveDBUPrice
+  def contractInteractiveDBUPrice: Double = _contractInteractiveDBUPrice
+  def contractAutomatedDBUPrice: Double = _contractAutomatedDBUPrice
+  def contractSQLComputeDBUPrice: Double = _contractSQLComputeDBUPrice
+  def contractJobsLightDBUPrice: Double = _contractJobsLightDBUPrice
 
-  private[overwatch] def contractAutomatedDBUPrice: Double = _contractAutomatedDBUPrice
+  def primordialDateString: Option[String] = _primordialDateString
 
-  private[overwatch] def primordialDateString: Option[String] = _primordialDateString
+  def intelligentScaling: IntelligentScaling = _intelligentScaling
 
-  private[overwatch] def globalFilters: Seq[Column] = {
+  def globalFilters: Seq[Column] = {
     Seq(
       col("organization_id") === organizationId
     )
@@ -168,6 +176,11 @@ class Config() {
     this
   }
 
+  private[overwatch] def setInitialWorkerCount(value: Int): this.type = {
+    _initialWorkerCount = value
+    this
+  }
+
   private[overwatch] def setPrimordialDateString(value: Option[String]): this.type = {
     if (value.nonEmpty) {
       logger.log(Level.INFO, s"CONFIG SET: Primordial Date String = ${value.get}")
@@ -195,8 +208,8 @@ class Config() {
     this
   }
 
-  private[overwatch] def setIsFirstRun(value: Boolean): this.type = {
-    _isFirstRun = value
+  private[overwatch] def setOverwatchSchemaVersion(value: String): this.type = {
+    _overwatchSchemaVersion = value
     this
   }
 
@@ -207,6 +220,21 @@ class Config() {
 
   private[overwatch] def setContractAutomatedDBUPrice(value: Double): this.type = {
     _contractAutomatedDBUPrice = value
+    this
+  }
+
+  private[overwatch] def setContractSQLComputeDBUPrice(value: Double): this.type = {
+    _contractSQLComputeDBUPrice = value
+    this
+  }
+
+  private[overwatch] def setContractJobsLightDBUPrice(value: Double): this.type = {
+    _contractJobsLightDBUPrice = value
+    this
+  }
+
+  private [overwatch] def setIntelligentScaling(value: IntelligentScaling): this.type = {
+    _intelligentScaling = value
     this
   }
 
@@ -257,7 +285,7 @@ class Config() {
       } else {
         if (_isLocalTesting) { // Local testing env vars
           _workspaceUrl = System.getenv("OVERWATCH_ENV")
-          //_cloudProvider setter not necessary -- done in local setup
+          _cloudProvider = if (_workspaceUrl.toLowerCase().contains("azure")) "azure" else "aws"
           rawToken = System.getenv("OVERWATCH_TOKEN")
           _tokenType = "Environment"
         } else { // Use default token for job owner
@@ -284,16 +312,29 @@ class Config() {
    * @param dbLocation
    * @return
    */
-  private[overwatch] def setDatabaseNameandLoc(dbName: String, dbLocation: String): this.type = {
-    _databaseLocation = dbLocation
+  private[overwatch] def setDatabaseNameAndLoc(dbName: String, dbLocation: String, dataLocation: String): this.type = {
+    val cleanDBLocation = PipelineFunctions.cleansePathURI(dbLocation)
+    val cleanETLDataLocation = PipelineFunctions.cleansePathURI(dataLocation)
+    _databaseLocation = cleanDBLocation
     _databaseName = dbName
-    println(s"DEBUG: Database Name and Location set to ${_databaseName} and ${_databaseLocation}")
+    _etlDataPathPrefix = dataLocation
+    println(s"DEBUG: Database Name and Location set to ${_databaseName} and ${_databaseLocation}.\n\n " +
+      s"DATA Prefix set to: $dataLocation")
+    if (dbLocation.contains("/user/hive/warehouse/")) println("\n\nWARNING!! You have chosen a database location in " +
+      "/user/hive/warehouse prefix. While the tables are created as external tables this still presents a risk that " +
+      "'drop database cascade' command will permanently delete all data for all Overwatch workspaces." +
+      "It's strongly recommended to specify a database outside of the /user/hive/warehouse prefix to prevent this.")
+    if (cleanDBLocation.toLowerCase == cleanETLDataLocation.toLowerCase) println("\n\nWARNING!! The ETL Database " +
+      "AND ETL Data Prefix locations " +
+      "are equal. If ETL database is accidentally dropped ALL data from all workspaces will be lost in spite of the " +
+      "tables being external. Specify a separate prefix for the ETL data to avoid this from happening.")
     this
   }
 
   private[overwatch] def setConsumerDatabaseNameandLoc(consumerDBName: String, consumerDBLocation: String): this.type = {
+    val cleanConsumerDBLocation = PipelineFunctions.cleansePathURI(consumerDBLocation)
+    _consumerDatabaseLocation = cleanConsumerDBLocation
     _consumerDatabaseName = consumerDBName
-    _consumerDatabaseLocation = consumerDBLocation
     println(s"DEBUG: Consumer Database Name and Location set to ${_consumerDatabaseName} and ${_consumerDatabaseLocation}")
     this
   }

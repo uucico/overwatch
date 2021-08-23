@@ -6,7 +6,7 @@ import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
 import org.apache.spark.sql.expressions.{Window, WindowSpec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Dataset, SparkSession}
+import org.apache.spark.sql.{AnalysisException, Column, DataFrame, Dataset}
 
 import java.time.LocalDate
 
@@ -99,6 +99,33 @@ object TransformFunctions {
       }
     }
 
+    /**
+     * Supports strings, numericals, booleans. Defined keys don't contain any other types thus this function should
+     * ensure no nulls present for keys
+     * @return
+     */
+    def fillAllNAs: DataFrame = {
+      df.na.fill(0).na.fill("0").na.fill(false)
+    }
+
+    /**
+     *
+     * @param name
+     * @param searchNestedFields NOT yet implemented
+     * @param caseSensitive
+     * @return
+     */
+    def hasFieldNamed(name: String, searchNestedFields: Boolean = false, caseSensitive: Boolean = false): Boolean = {
+      val (casedName, fieldNames) = if (caseSensitive) (name, df.columns) else (name.toLowerCase, df.columns.map(_.toLowerCase))
+      if (searchNestedFields) { // search nested
+        fieldNames.contains(casedName)
+      } else { // top level only
+        fieldNames.contains(casedName)
+      }
+    }
+
+//    private[overwatch] def colByName(df: DataFrame)(colName: String): StructField =
+//      df.schema.find(_.name.toLowerCase() == colName.toLowerCase()).get
   }
 
   object Costs {
@@ -406,7 +433,7 @@ object TransformFunctions {
   }
 
   def getClusterIdsWithNewEvents(filteredAuditLogDF: DataFrame,
-                                 clusterSnapshotTable: PipelineTable
+                                 clusterSnapshotTable: DataFrame
                                 ): DataFrame = {
 
     val newClustersIDs = filteredAuditLogDF
@@ -416,7 +443,7 @@ object TransformFunctions {
 
     val latestSnapW = Window.partitionBy(col("organization_id")).orderBy(col("Pipeline_SnapTS").desc)
     // capture long-running clusters not otherwise captured from audit
-    val currentlyRunningClusters = clusterSnapshotTable.asDF()
+    val currentlyRunningClusters = clusterSnapshotTable
       .withColumn("snapRnk", rank.over(latestSnapW))
       .filter(col("snapRnk") === 1)
       .filter(col("state") === "RUNNING")

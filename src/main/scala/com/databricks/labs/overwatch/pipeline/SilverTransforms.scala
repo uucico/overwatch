@@ -417,7 +417,7 @@ trait SilverTransforms extends SparkSessionWrapper {
       'clusterOwnerUserId, 'cluster_log_conf, 'init_scripts, 'custom_tags, 'ssh_public_keys,
       'cluster_source, 'spark_env_vars, 'spark_conf,
       when('ssh_public_keys.isNotNull, true).otherwise(false).alias("has_ssh_keys"),
-      'acl_path_prefix, 'instance_pool_id, 'instance_pool_name, 'spark_version, 'cluster_creator, 'idempotency_token,
+      'acl_path_prefix, 'driver_instance_pool_id, 'instance_pool_id, 'instance_pool_name, 'spark_version, 'cluster_creator, 'idempotency_token,
       'user_id, 'sourceIPAddress, 'single_user_name)
 
     auditRawDF
@@ -431,6 +431,7 @@ trait SilverTransforms extends SparkSessionWrapper {
 
   protected def buildClusterSpec(
                                   bronze_cluster_snap: PipelineTable,
+                                  pools_snapshot: PipelineTable,
                                   auditRawTable: PipelineTable
                                 )(df: DataFrame): DataFrame = {
     val lastClusterSnap = Window.partitionBy('organization_id, 'cluster_id).orderBy('Pipeline_SnapTS.desc)
@@ -450,21 +451,56 @@ trait SilverTransforms extends SparkSessionWrapper {
 
     val clusterBaseDF = clusterBase(df)
 
-    // TODO -- Issue_37 -- instance pool lookup pass in from bronze
-    val instancePoolLookup = auditRawTable.asDF
-      .filter('serviceName === "instancePools" && 'actionName === "create")
+    val driverSnapLookup =  pools_snapshot.asDF
+      .withColumn("timestamp", unix_timestamp('Pipeline_SnapTS) * 1000)
       .select(
-        'organization_id, get_json_object($"response.result", "$.instance_pool_id").alias("instance_pool_id"),
+        'timestamp, 'organization_id,
+        'instance_pool_id.alias("driver_instance_pool_id"),
+        'instance_pool_name.alias("pool_snap_driver_instance_pool_name"),
+        'node_type_id.alias("pool_snap_driver_node_type")
+      )
+
+    val workerSnapLookup =  pools_snapshot.asDF
+      .withColumn("timestamp", unix_timestamp('Pipeline_SnapTS) * 1000)
+      .select(
+        'timestamp, 'organization_id,
+        'instance_pool_id,
+        'instance_pool_name.alias("pool_snap_instance_pool_name"),
+        'node_type_id.alias("pool_snap_node_type")
+      )
+
+    val driverPoolLookup = auditRawTable.asDF
+      .filter('serviceName === "instancePools" && 'actionName.isin("create", "edit"))
+      .select(
+        'timestamp, 'organization_id,
+        when('actionName === "create", get_json_object($"response.result", "$.instance_pool_id"))
+          .otherwise($"requestParams.instance_pool_id") // actionName == edit
+          .alias("driver_instance_pool_id"),
+        $"requestParams.instance_pool_name".alias("driver_instance_pool_name"),
+        $"requestParams.node_type_id".alias("pool_driver_node_type")
+      )
+
+    val workerPoolLookup = auditRawTable.asDF
+      .filter('serviceName === "instancePools" && 'actionName.isin("create", "edit"))
+      .select(
+        'timestamp, 'organization_id,
+        when('actionName === "create", get_json_object($"response.result", "$.instance_pool_id"))
+          .otherwise($"requestParams.instance_pool_id") // actionName == edit
+          .alias("instance_pool_id"),
+        $"requestParams.instance_pool_name",
         $"requestParams.node_type_id".alias("pool_node_type")
       )
 
-    val filledDriverType = when('cluster_name.like("job-%-run-%"), coalesce('driver_node_type_id, 'node_type_id))
-      .when('instance_pool_id.isNotNull, 'pool_node_type)
-      .when(isSingleNode, 'node_type_id)
-      .otherwise(coalesce('driver_node_type_id, first('driver_node_type_id, true).over(clusterBefore), 'node_type_id))
+    // Issue_37 -- this will need to be reviewed for mixed pools (i.e. driver of different type)
+    val filledDriverType =
+      when('driver_instance_pool_id.isNotNull, coalesce('pool_driver_node_type, 'pool_snap_driver_node_type))
+        .when('instance_pool_id.isNotNull && 'driver_instance_pool_id.isNull, coalesce('pool_node_type, 'pool_snap_node_type))
+        .when('cluster_name.like("job-%-run-%"), coalesce('driver_node_type_id, 'node_type_id)) // when jobs clusters workers == driver driver node type is not defined
+        .when(isSingleNode, 'node_type_id) // null
+        .otherwise(coalesce('driver_node_type_id, first('driver_node_type_id, true).over(clusterBefore), 'node_type_id))
 
-    val filledWorkerType = when('instance_pool_id.isNotNull, 'pool_node_type)
-      .when(isSingleNode, lit(null).cast("string")) // singleNode clusters don't have worker nodes
+    val filledWorkerType = when(isSingleNode, lit(null).cast("string")) // singleNode clusters don't have worker nodes
+      .when('instance_pool_id.isNotNull, coalesce('pool_node_type, 'pool_snap_node_type))
       .otherwise('node_type_id)
 
     val numWorkers = when(isSingleNode, lit(0).cast("int")).otherwise('num_workers.cast("int"))
@@ -500,15 +536,21 @@ trait SilverTransforms extends SparkSessionWrapper {
       'spark_env_vars,
       'spark_conf,
       'acl_path_prefix,
+      'driver_instance_pool_id,
       'instance_pool_id,
-      'instance_pool_name,
+      when('instance_pool_id.isNotNull, coalesce('instance_pool_name, 'pool_snap_instance_pool_name))
+        .otherwise(lit(null).cast("string"))
+        .alias("instance_pool_name"),
+      when('driver_instance_pool_id.isNotNull, coalesce('driver_instance_pool_name, 'pool_snap_driver_instance_pool_name))
+        .otherwise(lit(null).cast("string"))
+        .alias("driver_instance_pool_name"),
       'spark_version,
       'idempotency_token,
       'timestamp,
       'userEmail)
 
     val clustersRemoved = clusterBaseDF
-      .filter($"response.statusCode" === 200) //?
+      .filter($"response.statusCode" === 200) // only show successful delete requests
       .filter('actionName.isin("permanentDelete"))
       .select('organization_id, 'cluster_id, 'userEmail.alias("deleted_by"))
 
@@ -520,9 +562,24 @@ trait SilverTransforms extends SparkSessionWrapper {
 
     clusterBaseDF
       .filter('actionName.isin("create", "edit"))
-      .filter($"response.statusCode" === 200) //?
-      .join(instancePoolLookup, Seq("organization_id", "instance_pool_id"), "left") //node_type must be derived from pool when cluster is pooled
-      // TODO -- Issue_37 -- this will need to be reviewed for mixed pools (i.e. driver of different type)
+      .toTSDF("timestamp", "organization_id", "instance_pool_id")
+      .lookupWhen(
+        workerPoolLookup
+          .toTSDF("timestamp", "organization_id", "instance_pool_id"), tsPartitionVal = 6
+      )
+      .lookupWhen(
+        workerSnapLookup
+          .toTSDF("timestamp", "organization_id", "instance_pool_id"), tsPartitionVal = 6
+      ).df
+      .toTSDF("timestamp", "organization_id", "driver_instance_pool_id")
+      .lookupWhen(
+        driverPoolLookup
+          .toTSDF("timestamp", "organization_id", "driver_instance_pool_id"), tsPartitionVal = 6
+      )
+      .lookupWhen(
+        driverSnapLookup
+          .toTSDF("timestamp", "organization_id", "driver_instance_pool_id"), tsPartitionVal = 6
+      ).df
       .select(clusterSpecBaseCols: _*)
       .join(creatorLookup, Seq("organization_id", "cluster_id"), "left")
       .join(clustersRemoved, Seq("organization_id", "cluster_id"), "left")
@@ -560,6 +617,7 @@ trait SilverTransforms extends SparkSessionWrapper {
     val jobs_statusCols: Array[Column] = Array(
       'organization_id, 'serviceName, 'actionName, 'timestamp,
       when('actionName === "create", get_json_object($"response.result", "$.job_id").cast("long"))
+        .when('actionName === "changeJobAcl", 'resourceId.cast("long"))
         .otherwise('job_id).cast("long").alias("jobId"),
       'job_type,
       'name.alias("jobName"),
@@ -579,10 +637,6 @@ trait SilverTransforms extends SparkSessionWrapper {
 
     val jobStatusBase = jobsBase
       .filter('actionName.isin("create", "delete", "reset", "update", "resetJobAcl", "changeJobAcl"))
-      .withColumn("jobId",
-        when('actionName === "changeJobAcl", 'resourceId.cast("long"))
-          .otherwise('jobId.cast("long"))
-      )
       .select(jobs_statusCols: _*)
       .withColumn("existing_cluster_id", coalesce('existing_cluster_id, get_json_object('new_settings, "$.existing_cluster_id")))
       .withColumn("new_cluster",
@@ -694,7 +748,7 @@ trait SilverTransforms extends SparkSessionWrapper {
         'date,
         'runId,
         'jobId,
-        'idInJob, 'jobClusterType, 'jobTaskType, 'jobTerminalState,
+        'idInJob, 'clusterId, 'jobClusterType, 'jobTaskType, 'jobTerminalState,
         'jobTriggerType,
         'requestId.alias("completionRequestID"),
         'response.alias("completionResponse"),
@@ -792,6 +846,7 @@ trait SilverTransforms extends SparkSessionWrapper {
       .select(
         'organization_id, 'date,
         'runId,
+        'clusterId.alias("startClusterId"),
         'timestamp.alias("startTime"),
         'requestId.alias("startRequestID")
       )
@@ -819,9 +874,13 @@ trait SilverTransforms extends SparkSessionWrapper {
           'created_time.alias("timestamp"))
     } else {
       jobsSnapshot.asDF
-        .select('organization_id, 'job_id.alias("jobId"),
-          'created_time.alias("timestamp"))
-    }.filter('clusterId.isNotNull)
+        .select(
+          'organization_id,
+          'job_id.alias("jobId"),
+          'created_time.alias("timestamp"),
+          lit(null).cast("string").alias("clusterId")
+        )
+    }
 
     // Ensure the lookups have data -- this will be improved when the module unification occurs during the next
     // scheduled refactor
@@ -844,7 +903,8 @@ trait SilverTransforms extends SparkSessionWrapper {
         'runId.cast("long"), 'jobId.cast("long"), 'idInJob, 'jobRunTime, 'run_name,
         'jobClusterType, 'jobTaskType, 'jobTerminalState,
         'jobTriggerType, 'new_cluster,
-        'existing_cluster_id.alias("clusterId"),
+        when('actionName.isin("runStart", "runFailed", "runSucceeded"), coalesce('clusterId, 'startClusterId)) // notebookRuns
+          .otherwise('existing_cluster_id).alias("clusterId"), //
         'cluster_name,
         'organization_id,
         'notebook_params, 'libraries,
@@ -889,7 +949,16 @@ trait SilverTransforms extends SparkSessionWrapper {
      * rolled into 3.42 but until then, this is the hack around.
      */
 
-    val taskSupport = new ForkJoinTaskSupport(new ForkJoinPool(24))
+    /**
+     * UPDATE -- as of 0.4.13, enabled fix from ES-74247 and resolved Issue_138 thus this api call is only for
+     * legacy audit logs prior to approximately April 01, 2021. If historically loading audit logs, this api call
+     * could still be necessary; otherwise, it should never be hit.
+     */
+
+    logger.log(Level.INFO, s"HISTORICAL TRICKLE LOAD: notebook job run on existing clusters have been " +
+      s"identified prior to the April 01, 2021 resolution, the historical data will be trickle loaded. Please be " +
+      s"patient as this is a one-time trickle load to back-load old data.")
+    val taskSupport = new ForkJoinTaskSupport(new ForkJoinPool(2))
     val jrWFilledClusterIDs = jobRunsBase
       .filter('jobClusterType === "existing")
       .filter('jobTaskType === "notebook" && 'clusterId.isNull)
@@ -903,36 +972,54 @@ trait SilverTransforms extends SparkSessionWrapper {
       .collect()
       .par
 
-    jrWFilledClusterIDs.tasksupport = taskSupport
+    // If current batch does not include any runs with existing clusters, omit this lookup altogether.
+    val jrBaseExisting = if (jrWFilledClusterIDs.nonEmpty) {
+      jrWFilledClusterIDs.tasksupport = taskSupport
 
-    logger.log(Level.INFO, s"RUN_IDs staged for api grabber: ${jrWFilledClusterIDs.mkString(", ")}")
+      logger.log(Level.INFO, s"RUN_IDs staged for api grabber: ${jrWFilledClusterIDs.mkString(", ")}")
 
-    val runIdStrings = jrWFilledClusterIDs
-      .flatMap(runId => {
-        try {
-          val q = Map(
-            "run_id" -> runId
-          )
-          val runIDString = ApiCall("jobs/runs/get", apiEnv, Some(q), paginate = false)
-            .executeGet().asStrings
-          logger.log(Level.INFO, s"API CALL SUCCESS: RUN_ID == $runId")
-          runIDString
-        } catch {
-          case e: Throwable =>
-            logger.log(Level.ERROR, s"API CALL FAILED: RUN_ID == $runId --> ${e.getMessage}")
-            Array[String]()
-        }
-      })
-      .toArray
+      val runIdStrings = jrWFilledClusterIDs
+        .flatMap(runId => {
+          try {
+            val q = Map(
+              "run_id" -> runId
+            )
+            val runIDString = ApiCall("jobs/runs/get", apiEnv, Some(q), paginate = false)
+              .executeGet().asStrings
+            logger.log(Level.INFO, s"API CALL SUCCESS: RUN_ID == $runId")
+            runIDString
+          } catch {
+            case e: Throwable =>
+              logger.log(Level.ERROR, s"API CALL FAILED: RUN_ID == $runId --> ${e.getMessage}")
+              Array[String]()
+          }
+        })
+        .toArray
 
-    val notebookJobsWithClusterIDs = spark.read.json(Seq(runIdStrings: _*).toDS())
-      .select('run_id.alias("runId"), $"cluster_spec.existing_cluster_id".alias("cluster_id_apiLookup"))
+      val notebookJobsWithClusterIDs = if(runIdStrings.nonEmpty){
+        spark.read.json(Seq(runIdStrings: _*).toDS())
+          .select('run_id.alias("runId"), $"cluster_spec.existing_cluster_id".alias("cluster_id_apiLookup"))
+      } else { // defend against API runId calls with no result missing
+        val missingRunIDMsg = s"A cluster ID could not be determined for the following runs. ${jrWFilledClusterIDs.toArray.mkString(", ")}"
+        logger.log(Level.WARN, missingRunIDMsg)
+        spark.emptyDataFrame
+          .withColumn("runId", lit(null).cast("long"))
+          .withColumn("cluster_id_apiLookup", lit(null).cast("string"))
+      }
 
-    val jrBaseExisting = jobRunsBase
-      .filter('jobClusterType === "existing")
-      .join(notebookJobsWithClusterIDs, Seq("runId"), "left")
-      .withColumn("clusterId", when('jobTaskType === "notebook" && 'clusterId.isNull, 'cluster_id_apiLookup).otherwise('clusterId))
-      .drop("cluster_id_apiLookup")
+      // If batch has runs on existing clusters older than the API retention the previous DF will be empty. Only join
+      // if the api lookup successfully obtained the data
+      if (!notebookJobsWithClusterIDs.isEmpty) {
+        jobRunsBase
+          .filter('jobClusterType === "existing")
+          .join(notebookJobsWithClusterIDs, Seq("runId"), "left")
+          .withColumn("clusterId", when('jobTaskType === "notebook" && 'clusterId.isNull, 'cluster_id_apiLookup).otherwise('clusterId))
+          .drop("cluster_id_apiLookup")
+      } else jobRunsBase
+    } else {
+      jobRunsBase
+        .filter('jobClusterType === "existing")
+    }
 
     val automatedJobRunsBase = jobRunsBase
       .filter('jobClusterType === "new")
