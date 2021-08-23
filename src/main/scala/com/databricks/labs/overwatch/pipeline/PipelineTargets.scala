@@ -5,22 +5,37 @@ import com.databricks.labs.overwatch.utils.{Config, Frequency}
 abstract class PipelineTargets(config: Config) {
 
   /**
+   * global pipeline state table
+   */
+  val pipelineStateTarget: PipelineTable = PipelineTable(
+    name = "pipeline_report",
+    _keys = Array("organization_id", "Overwatch_RunID"),
+    config = config,
+    partitionBy = Array("organization_id"),
+    incrementalColumns = Array("Pipeline_SnapTS"),
+    statsColumns = ("moduleID, moduleName, runStartTS, runEndTS, fromTS, untilTS, dataFrequency, status, " +
+      "recordsAppended, lastOptimizedTS, Pipeline_SnapTS, organization_id, primordialDateString").split(", ")
+  )
+
+  /**
    * Bronze Targets
    */
   object BronzeTargets {
 
     lazy private[overwatch] val jobsSnapshotTarget: PipelineTable = PipelineTable(
       name = "jobs_snapshot_bronze",
-      keys = Array("organization_id", "job_id"),
+      _keys = Array("job_id", "Overwatch_RunID"),
       config,
+      incrementalColumns = Array("Pipeline_SnapTS"),
       statsColumns = "created_time, creator_user_name, job_id, Pipeline_SnapTS, Overwatch_RunID".split(", "),
       partitionBy = Seq("organization_id")
     )
 
     lazy private[overwatch] val clustersSnapshotTarget: PipelineTable = PipelineTable(
       name = "clusters_snapshot_bronze",
-      keys = Array("organization_id", "cluster_id"),
+      _keys = Array("cluster_id", "Overwatch_RunID"),
       config,
+      incrementalColumns = Array("Pipeline_SnapTS"),
       statsColumns = ("organization_id, cluster_id, driver_node_type_id, instance_pool_id, node_type_id, " +
         "start_time, terminated_time, Overwatch_RunID").split(", "),
       partitionBy = Seq("organization_id")
@@ -28,8 +43,9 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val poolsTarget: PipelineTable = PipelineTable(
       name = "pools_snapshot_bronze",
-      keys = Array("organization_id", "instance_pool_id"),
+      _keys = Array("instance_pool_id", "Overwatch_RunID"),
       config,
+      incrementalColumns = Array("Pipeline_SnapTS"),
       statsColumns = ("instance_pool_id, node_type_id, " +
         "Pipeline_SnapTS, Overwatch_RunID").split(", "),
       partitionBy = Seq("organization_id")
@@ -37,7 +53,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val auditLogsTarget: PipelineTable = PipelineTable(
       name = "audit_log_bronze",
-      keys = Array("organization_id", "requestId"),
+      _keys = Array("serviceName", "actionName", "requestId"),
       config,
       incrementalColumns = Array("date", "timestamp"),
       partitionBy = Seq("organization_id", "date"),
@@ -49,9 +65,10 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val auditLogAzureLandRaw: PipelineTable = PipelineTable(
       name = "audit_log_raw_events",
-      keys = Array("sequenceNumber"),
+      _keys = Array("sequenceNumber"),
       config,
       partitionBy = Seq("organization_id", "Overwatch_RunID", "__overwatch_ctrl_noise"),
+      incrementalColumns = Array("Pipeline_SnapTS"),
       withOverwatchRunID = if (config.cloudProvider == "azure") false else true,
       checkpointPath = if (config.cloudProvider == "azure")
         config.auditLogConfig.azureAuditLogEventhubConfig.get.auditRawEventsChk
@@ -60,7 +77,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val clusterEventsTarget: PipelineTable = PipelineTable(
       name = "cluster_events_bronze",
-      keys = Array("organization_id", "cluster_id", "timestamp"),
+      _keys = Array("cluster_id", "type", "timestamp"),
       config,
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise"),
       incrementalColumns = Array("timestamp"),
@@ -68,9 +85,9 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val sparkEventLogsTarget: PipelineTable = PipelineTable(
       name = "spark_events_bronze",
-      keys = Array("organization_id", "Event"), // really aren't any global valid keys for this table
+      _keys = Array("Event"), // really aren't any global valid keys for this table
       config,
-      incrementalColumns = Array("fileCreateEpochMS"),
+      incrementalColumns = Array("fileCreateDate", "fileCreateEpochMS"),
       partitionBy = Seq("organization_id", "Event", "fileCreateDate"),
       statsColumns = ("organization_id, Event, clusterId, SparkContextId, JobID, StageID," +
         "StageAttemptID, TaskType, ExecutorID, fileCreateDate, fileCreateEpochMS, fileCreateTS, filename," +
@@ -88,28 +105,25 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val processedEventLogs: PipelineTable = PipelineTable(
       name = "spark_events_processedFiles",
-      keys = Array("filename"),
+      _keys = Array("filename"),
       config,
+      incrementalColumns = Array("Pipeline_SnapTS"),
       partitionBy = Seq("organization_id")
     )
 
-    lazy private[overwatch] val cloudMachineDetail: PipelineTable = if (config.cloudProvider == "azure") {
-      PipelineTable(
-        "instanceDetails",
-        Array("API_Name"),
-        config, mode = "overwrite",
-        _databaseName = config.consumerDatabaseName,
-        partitionBy = Seq("organization_id")
-      )
-    } else {
-      PipelineTable(
-        "instanceDetails",
-        Array("API_Name"),
-        config, mode = "overwrite",
-        _databaseName = config.consumerDatabaseName,
-        partitionBy = Seq("organization_id")
-      )
-    }
+    lazy private[overwatch] val cloudMachineDetail: PipelineTable = PipelineTable(
+      name = "instanceDetails",
+      _keys = Array("API_Name"),
+      config,
+      incrementalColumns = Array("Pipeline_SnapTS"),
+      partitionBy = Seq("organization_id")
+    )
+
+    lazy private[overwatch] val cloudMachineDetailViewTarget: PipelineView = PipelineView(
+      name = "instanceDetails",
+      cloudMachineDetail,
+      config
+    )
 
   }
 
@@ -128,9 +142,10 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val executorsTarget: PipelineTable = PipelineTable(
       name = "spark_executors_silver",
-      keys = Array("SparkContextID", "ExecutorID"),
+      _keys = Array("SparkContextID", "ExecutorID"),
       config,
       partitionBy = Seq("organization_id"),
+      incrementalColumns = Array("addedTimestamp"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",
@@ -141,9 +156,10 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val executionsTarget: PipelineTable = PipelineTable(
       name = "spark_Executions_silver",
-      keys = Array("SparkContextID", "ExecutionID"),
+      _keys = Array("SparkContextID", "ExecutionID"),
       config,
       partitionBy = Seq("organization_id"),
+      incrementalColumns = Array("startTimestamp"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",
@@ -154,21 +170,22 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val jobsTarget: PipelineTable = PipelineTable(
       name = "spark_jobs_silver",
-      keys = Array("SparkContextID", "JobID"),
+      _keys = Array("SparkContextID", "JobID"),
       config,
       incrementalColumns = Array("startDate", "startTimestamp"),
       partitionBy = Seq("organization_id", "startDate"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",
-        "spark.databricks.delta.optimizeWrite.binSize" -> "2048"
+        "spark.databricks.delta.optimizeWrite.binSize" -> "2048",
+        "spark.sql.files.maxPartitionBytes" -> (1024 * 1024 * 64).toString
       ),
-      shuffleFactor = 0.25
+      shuffleFactor = 0.75
     )
 
     lazy private[overwatch] val stagesTarget: PipelineTable = PipelineTable(
       name = "spark_stages_silver",
-      keys = Array("SparkContextID", "StageID", "StageAttemptID"),
+      _keys = Array("SparkContextID", "StageID", "StageAttemptID"),
       config,
       incrementalColumns = Array("startDate", "startTimestamp"),
       partitionBy = Seq("organization_id", "startDate"),
@@ -182,7 +199,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val tasksTarget: PipelineTable = PipelineTable(
       name = "spark_tasks_silver",
-      keys = Array("SparkContextID", "StageID", "StageAttemptID", "TaskID"),
+      _keys = Array("SparkContextID", "StageID", "StageAttemptID", "TaskID", "TaskAttempt", "ExecutorID", "Host"),
       config,
       incrementalColumns = Array("startDate", "startTimestamp"),
       partitionBy = Seq("organization_id", "startDate"),
@@ -196,7 +213,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val dbJobRunsTarget: PipelineTable = PipelineTable(
       name = "jobrun_silver",
-      keys = Array("timestamp", "runId"),
+      _keys = Array("runId", "idInJob", "endEpochMS"),
       config,
       incrementalColumns = Array("endEpochMS"), // don't load into gold until run is terminated
       zOrderBy = Array("runId", "jobId"),
@@ -205,7 +222,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val accountLoginTarget: PipelineTable = PipelineTable(
       name = "account_login_silver",
-      keys = Array("timestamp", "userEmail"),
+      _keys = Array("timestamp", "login_type", "requestId", "sourceIPAddress"),
       config,
       incrementalColumns = Array("timestamp"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -213,7 +230,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val accountModTarget: PipelineTable = PipelineTable(
       name = "account_mods_silver",
-      keys = Array("requestId"),
+      _keys = Array("requestId"),
       config,
       incrementalColumns = Array("timestamp"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -221,7 +238,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val clustersSpecTarget: PipelineTable = PipelineTable(
       name = "cluster_spec_silver",
-      keys = Array("timestamp", "cluster_id"),
+      _keys = Array("timestamp", "cluster_id"),
       config,
       incrementalColumns = Array("timestamp"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -229,7 +246,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val dbJobsStatusTarget: PipelineTable = PipelineTable(
       name = "job_status_silver",
-      keys = Array("timestamp", "job_id"),
+      _keys = Array("timestamp", "jobId"),
       config,
       incrementalColumns = Array("timestamp"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -237,7 +254,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val notebookStatusTarget: PipelineTable = PipelineTable(
       name = "notebook_silver",
-      keys = Array("timestamp", "notebook_id"),
+      _keys = Array("notebookId", "requestId", "actionName", "timestamp"),
       config,
       incrementalColumns = Array("timestamp"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -249,7 +266,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val clusterTarget: PipelineTable = PipelineTable(
       name = "cluster_gold",
-      keys = Array("cluster_id", "unixTimeMS"),
+      _keys = Array("cluster_id", "unixTimeMS"),
       config,
       incrementalColumns = Array("unixTimeMS"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -263,7 +280,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val jobTarget: PipelineTable = PipelineTable(
       name = "job_gold",
-      keys = Array("job_id", "unixTimeMS"),
+      _keys = Array("job_id", "unixTimeMS"),
       config,
       incrementalColumns = Array("unixTimeMS"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -277,7 +294,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val jobRunTarget: PipelineTable = PipelineTable(
       name = "jobRun_gold",
-      keys = Array("run_id", "unixTimeMS"),
+      _keys = Array("run_id", "id_in_job", "endEpochMS"),
       config,
       incrementalColumns = Array("endEpochMS"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
@@ -291,10 +308,13 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val jobRunCostPotentialFactTarget: PipelineTable = PipelineTable(
       name = "jobRunCostPotentialFact_gold",
-      keys = Array("organization_id", "job_id", "id_in_job"),
+      _keys = Array("job_id", "id_in_job"),
       config,
-      incrementalColumns = Array("job_start_date"),
-      partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
+      incrementalColumns = Array("endEpochMS"),
+      partitionBy = Seq("organization_id", "__overwatch_ctrl_noise"),
+      sparkOverrides = Map(
+        "spark.sql.autoBroadcastJoinThreshold" -> "-1"
+      )
     )
 
     lazy private[overwatch] val jobRunCostPotentialFactViewTarget: PipelineView = PipelineView(
@@ -305,7 +325,7 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val notebookTarget: PipelineTable = PipelineTable(
       name = "notebook_gold",
-      keys = Array("notebook_id", "unixTimeMS"),
+      _keys = Array("notebook_id", "request_id", "action", "unixTimeMS"),
       config,
       incrementalColumns = Array("unixTimeMS"),
       partitionBy = Seq("organization_id")
@@ -319,9 +339,9 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val accountModsTarget: PipelineTable = PipelineTable(
       name = "account_mods_gold",
-      keys = Array("requestId"),
+      _keys = Array("action", "mod_unixTimeMS", "request_id"),
       config,
-      incrementalColumns = Array("timestamp"),
+      incrementalColumns = Array("mod_unixTimeMS"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
     )
 
@@ -334,9 +354,9 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val accountLoginTarget: PipelineTable = PipelineTable(
       name = "account_login_gold",
-      keys = Array("requestId"),
+      _keys = Array("request_id", "login_type", "login_unixTimeMS", "from_ip_address"),
       config,
-      incrementalColumns = Array("timestamp"),
+      incrementalColumns = Array("login_unixTimeMS"),
       partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
     )
 
@@ -349,11 +369,11 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val clusterStateFactTarget: PipelineTable = PipelineTable(
       name = "clusterStateFact_gold",
-      keys = Array("cluster_id", "unixTimeMS"),
+      _keys = Array("cluster_id", "state", "unixTimeMS_state_end"),
       config,
-      incrementalColumns = Array("unixTimeMS_state_start"),
-      zOrderBy = Array("unixTimeMS_state_start", "cluster_id"),
-      partitionBy = Seq("organization_id", "__overwatch_ctrl_noise")
+      partitionBy = Seq("organization_id", "__overwatch_ctrl_noise"),
+      incrementalColumns = Array("unixTimeMS_state_end"),
+      zOrderBy = Array("unixTimeMS_state_end", "timestamp_state_end", "timestamp_state_start", "cluster_id")
     )
 
     lazy private[overwatch] val clusterStateFactViewTarget: PipelineView = PipelineView(
@@ -364,16 +384,16 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val sparkJobTarget: PipelineTable = PipelineTable(
       name = "sparkJob_gold",
-      keys = Array("spark_context_id", "job_id"),
+      _keys = Array("spark_context_id", "job_id"),
       config,
       partitionBy = Seq("organization_id", "date"),
+      incrementalColumns = Array("date", "unixTimeMS"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",
         "spark.databricks.delta.optimizeWrite.binSize" -> "2048" // output is very dense, shrink output file size
       ),
-      zOrderBy = Array("cluster_id"),
-      incrementalColumns = Array("unixTimeMS")
+      zOrderBy = Array("cluster_id")
     )
 
     lazy private[overwatch] val sparkJobViewTarget: PipelineView = PipelineView(
@@ -384,16 +404,16 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val sparkStageTarget: PipelineTable = PipelineTable(
       name = "sparkStage_gold",
-      keys = Array("spark_context_id", "stage_id", "stage_attempt_id"),
+      _keys = Array("spark_context_id", "stage_id", "stage_attempt_id"),
       config,
       partitionBy = Seq("organization_id", "date"),
+      incrementalColumns = Array("date", "unixTimeMS"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",
         "spark.databricks.delta.optimizeWrite.binSize" -> "2048" // output is very dense, shrink output file size
       ),
-      zOrderBy = Array("cluster_id"),
-      incrementalColumns = Array("unixTimeMS")
+      zOrderBy = Array("cluster_id")
     )
 
     lazy private[overwatch] val sparkStageViewTarget: PipelineView = PipelineView(
@@ -404,11 +424,11 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val sparkTaskTarget: PipelineTable = PipelineTable(
       name = "sparkTask_gold",
-      keys = Array("spark_context_id", "task_id", "task_attempt_id"),
+      _keys = Array("spark_context_id", "task_id", "task_attempt_id"),
       config,
       partitionBy = Seq("organization_id", "date"),
       zOrderBy = Array("cluster_id"),
-      incrementalColumns = Array("unixTimeMS"),
+      incrementalColumns = Array("date", "unixTimeMS"),
       shuffleFactor = 5,
       autoOptimize = true,
       sparkOverrides = Map(
@@ -425,10 +445,10 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val sparkExecutionTarget: PipelineTable = PipelineTable(
       name = "sparkExecution_gold",
-      keys = Array("spark_context_id", "execution_id"),
+      _keys = Array("spark_context_id", "execution_id"),
       config,
-      incrementalColumns = Array("unixTimeMS"),
       partitionBy = Seq("organization_id"),
+      incrementalColumns = Array("unixTimeMS"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",
@@ -444,10 +464,10 @@ abstract class PipelineTargets(config: Config) {
 
     lazy private[overwatch] val sparkExecutorTarget: PipelineTable = PipelineTable(
       name = "sparkExecutor_gold",
-      keys = Array("spark_context_id", "executor_id"),
+      _keys = Array("spark_context_id", "executor_id"),
       config,
-      incrementalColumns = Array("unixTimeMS"),
       partitionBy = Seq("organization_id"),
+      incrementalColumns = Array("unixTimeMS"),
       autoOptimize = true,
       sparkOverrides = Map(
         "spark.databricks.delta.optimizeWrite.numShuffleBlocks" -> "500000",

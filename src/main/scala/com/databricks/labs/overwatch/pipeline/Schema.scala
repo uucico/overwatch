@@ -97,6 +97,7 @@ object Schema extends SparkSessionWrapper {
         StructField("clusterState", StringType, nullable = true),
         StructField("jobId", LongType, nullable = true),
         StructField("job_id", LongType, nullable = true),
+        StructField("jobTaskType", StringType, nullable = true),
         StructField("job_type", StringType, nullable = true),
         StructField("runId", LongType, nullable = true),
         StructField("run_id", LongType, nullable = true),
@@ -156,6 +157,7 @@ object Schema extends SparkSessionWrapper {
         StructField("spark_env_vars", StringType, nullable = true),
         StructField("spark_conf", StringType, nullable = true),
         StructField("acl_path_prefix", StringType, nullable = true),
+        StructField("driver_instance_pool_id", StringType, nullable = true),
         StructField("instance_pool_id", StringType, nullable = true),
         StructField("instance_pool_name", StringType, nullable = true),
         StructField("spark_version", StringType, nullable = true),
@@ -204,6 +206,10 @@ object Schema extends SparkSessionWrapper {
         StructField("MemoryBytesSpilled", LongType, nullable = true),
         StructField("DiskBytesSpilled", LongType, nullable = true),
         StructField("ResultSize", LongType, nullable = true)
+      )), nullable = true),
+    StructField("TaskExecutorMetrics",
+      StructType(Seq(
+        StructField("JVMHeapMemory", LongType, nullable = true)
       )), nullable = true),
     StructField("TaskType", StringType, nullable = true),
     StructField("TaskEndReason",
@@ -257,6 +263,11 @@ object Schema extends SparkSessionWrapper {
    * Gold Layer 3xxx
    */
   private[overwatch] val minimumSchemasByModule: Map[Int, StructType] = Map(
+    1005 -> StructType(Seq(
+      StructField("organization_id", StringType, nullable = false),
+      StructField("state",StringType, nullable = true),
+      StructField("cluster_id",StringType, nullable = true)
+    )),
     1006 -> auditMasterSchema,
     // SparkExecutors
     2003 -> sparkEventsRawMasterSchema,

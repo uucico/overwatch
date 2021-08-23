@@ -1,13 +1,15 @@
 package com.databricks.labs.overwatch.utils
 
-import com.databricks.labs.overwatch.pipeline.PipelineTable
+import com.databricks.labs.overwatch.pipeline.{Module, PipelineTable}
 import com.databricks.labs.overwatch.utils.Frequency.Frequency
 import com.databricks.labs.overwatch.utils.OverwatchScope.OverwatchScope
+import com.databricks.labs.overwatch.validation.SnapReport
 import org.apache.log4j.Level
 import org.apache.spark.sql.Column
 import org.apache.spark.sql.catalyst.ScalaReflection
 import org.apache.spark.sql.types.{StructField, StructType}
 
+import java.sql.Timestamp
 import java.text.SimpleDateFormat
 import java.time.{LocalDateTime, ZonedDateTime}
 import java.util.Date
@@ -20,10 +22,15 @@ case class GangliaDetail()
 
 case class TokenSecret(scope: String, key: String)
 
-case class DataTarget(databaseName: Option[String], databaseLocation: Option[String],
+case class DataTarget(databaseName: Option[String], databaseLocation: Option[String], etlDataPathPrefix: Option[String],
                       consumerDatabaseName: Option[String] = None, consumerDatabaseLocation: Option[String] = None)
 
-case class DatabricksContractPrices(interactiveDBUCostUSD: Double, automatedDBUCostUSD: Double)
+case class DatabricksContractPrices(
+                                     interactiveDBUCostUSD: Double = 0.55,
+                                     automatedDBUCostUSD: Double = 0.15,
+                                     sqlComputeDBUCostUSD: Double = 0.22,
+                                     jobsLightDBUCostUSD: Double = 0.10
+                                   )
 
 case class ApiEnv(isLocal: Boolean, workspaceURL: String, rawToken: String, packageVersion: String)
 
@@ -57,7 +64,13 @@ case class AzureAuditLogEventhubConfig(
                                         auditLogChk: Option[String] = None
                                       )
 
-case class AuditLogConfig(rawAuditPath: Option[String] = None, azureAuditLogEventhubConfig: Option[AzureAuditLogEventhubConfig] = None)
+case class AuditLogConfig(
+                           rawAuditPath: Option[String] = None,
+                           auditLogFormat: String = "json",
+                           azureAuditLogEventhubConfig: Option[AzureAuditLogEventhubConfig] = None
+                         )
+
+case class IntelligentScaling(enabled: Boolean = false, minimumCores: Int = 4, maximumCores: Int = 512, coeff: Double = 1.0)
 
 case class OverwatchParams(auditLogConfig: AuditLogConfig,
                            tokenSecret: Option[TokenSecret] = None,
@@ -65,8 +78,9 @@ case class OverwatchParams(auditLogConfig: AuditLogConfig,
                            badRecordsPath: Option[String] = None,
                            overwatchScope: Option[Seq[String]] = None,
                            maxDaysToLoad: Int = 60,
-                           databricksContractPrices: DatabricksContractPrices = DatabricksContractPrices(0.56, 0.26),
-                           primordialDateString: Option[String] = None
+                           databricksContractPrices: DatabricksContractPrices = DatabricksContractPrices(),
+                           primordialDateString: Option[String] = None,
+                           intelligentScaling: IntelligentScaling = IntelligentScaling()
                           )
 
 case class ParsedConfig(
@@ -130,7 +144,9 @@ case class SimplifiedModuleStatusReport(
                                          vacuumRetentionHours: Int
                                        )
 
-case class IncrementalFilter(cronColName: String, low: Column, high: Column)
+case class IncrementalFilter(cronField: StructField, low: Column, high: Column)
+
+case class UpgradeReport(db: String, tbl: String, errorMsg: Option[String])
 
 object OverwatchScope extends Enumeration {
   type OverwatchScope = Value
@@ -153,17 +169,55 @@ private[overwatch] class NoNewDataException(s: String, val level: Level, val all
 
 private[overwatch] class UnhandledException(s: String) extends Exception(s) {}
 
+private[overwatch] class IncompleteFilterException(s: String) extends Exception(s) {}
+
 private[overwatch] class ApiCallFailure(s: String) extends Exception(s) {}
 
 private[overwatch] class TokenError(s: String) extends Exception(s) {}
 
-private[overwatch] class BadConfigException(s: String) extends Exception(s) {}
+private[overwatch] class PipelineStateException(s: String, val target: Option[PipelineTable]) extends Exception(s) {}
+
+private[overwatch] class BadConfigException(s: String, val failPipeline: Boolean = true) extends Exception(s) {}
 
 private[overwatch] class FailedModuleException(s: String, val target: PipelineTable) extends Exception(s) {}
 
 private[overwatch] class UnsupportedTypeException(s: String) extends Exception(s) {}
 
 private[overwatch] class BadSchemaException(s: String) extends Exception(s) {}
+
+private[overwatch] class UpgradeException(s: String, target: PipelineTable) extends Exception(s) {
+  def getUpgradeReport: UpgradeReport = {
+    UpgradeReport(target.databaseName, target.name, Some(s))
+  }
+}
+
+private[overwatch] class BronzeSnapException(
+                                              s: String,
+                                              target: PipelineTable,
+                                              module: Module
+                                            ) extends Exception(s) {
+  private val pipeline = module.pipeline
+  private val emptyModule = pipeline.getModuleState(module.moduleId).isEmpty
+  private val fromTime = if (emptyModule) {
+    new Timestamp(pipeline.primordialTime.asUnixTimeMilli)
+  } else {
+    new Timestamp(module.fromTime.asUnixTimeMilli)
+  }
+
+  private val untilTime = if (emptyModule) {
+    new Timestamp(pipeline.pipelineSnapTime.asUnixTimeMilli)
+  } else {
+    new Timestamp(module.untilTime.asUnixTimeMilli)
+  }
+
+  val errMsg = s"FAILED SNAP: ${target.tableFullName} --> MODULE: ${module.moduleName}: SNAP ERROR:\n$s"
+  val snapReport: SnapReport = SnapReport(
+    target.tableFullName,
+    fromTime,
+    untilTime,
+    errMsg
+  )
+}
 
 object OverwatchEncoders {
   implicit def overwatchScopeValues: org.apache.spark.sql.Encoder[Array[OverwatchScope.Value]] =

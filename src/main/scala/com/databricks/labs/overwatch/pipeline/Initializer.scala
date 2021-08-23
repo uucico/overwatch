@@ -20,6 +20,12 @@ import org.apache.log4j.{Level, Logger}
 class Initializer(config: Config) extends SparkSessionWrapper {
 
   private val logger: Logger = Logger.getLogger(this.getClass)
+  private var _isSnap: Boolean = false
+  private def setIsSnap(value: Boolean): this.type = {
+    _isSnap = value
+    this
+  }
+  private def isSnap: Boolean = _isSnap
 
   /**
    * Initialize the "Database" object
@@ -32,16 +38,22 @@ class Initializer(config: Config) extends SparkSessionWrapper {
   private def initializeDatabase(): Database = {
     // TODO -- Add metadata table
     // TODO -- refactor and clean up duplicity
-    logger.log(Level.INFO, "Initializing ETL Database")
+    val dbMeta = if (isSnap) {
+      logger.log(Level.INFO, "Initializing Snap Database")
+      "OVERWATCHDB='TRUE',SNAPDB='TRUE'"
+    } else {
+      logger.log(Level.INFO, "Initializing ETL Database")
+      "OVERWATCHDB='TRUE'"
+    }
     if (!spark.catalog.databaseExists(config.databaseName)) {
       logger.log(Level.INFO, s"Database ${config.databaseName} not found, creating it at " +
         s"${config.databaseLocation}.")
       val createDBIfNotExists = if (!config.isLocalTesting) {
         s"create database if not exists ${config.databaseName} location '" +
-          s"${config.databaseLocation}' WITH DBPROPERTIES (OVERWATCHDB='TRUE',SCHEMA=${config.overwatchSchemaVersion})"
+          s"${config.databaseLocation}' WITH DBPROPERTIES ($dbMeta,SCHEMA=${config.overwatchSchemaVersion})"
       } else {
         s"create database if not exists ${config.databaseName} " +
-          s"WITH DBPROPERTIES (OVERWATCHDB='TRUE',SCHEMA=${config.overwatchSchemaVersion})"
+          s"WITH DBPROPERTIES ($dbMeta,SCHEMA=${config.overwatchSchemaVersion})"
       }
       spark.sql(createDBIfNotExists)
       logger.log(Level.INFO, s"Successfully created database. $createDBIfNotExists")
@@ -64,12 +76,28 @@ class Initializer(config: Config) extends SparkSessionWrapper {
     Database(config)
   }
 
+  private def validateIntelligentScaling(intelligentScaling: IntelligentScaling): IntelligentScaling = {
+    if (intelligentScaling.enabled) {
+      if (intelligentScaling.minimumCores < 1)
+        throw new BadConfigException(s"Intelligent Scaling: Minimum cores must be > 0. Set to ${intelligentScaling.minimumCores}")
+      if (intelligentScaling.minimumCores > intelligentScaling.maximumCores)
+        throw new BadConfigException(s"Intelligent Scaling: Minimum cores must be > 0. \n" +
+          s"Minimum = ${intelligentScaling.minimumCores}\nMaximum = ${intelligentScaling.maximumCores}")
+      if (intelligentScaling.coeff >= 10.0 || intelligentScaling.coeff <= 0.0)
+        throw new BadConfigException(s"Intelligent Scaling: Scaling Coeff must be between 0.0 and 10.0 (exclusive). \n" +
+          s"coeff configured at = ${intelligentScaling.coeff}")
+    }
+
+    intelligentScaling
+  }
+
   @throws(classOf[BadConfigException])
   private def validateAuditLogConfigs(auditLogConfig: AuditLogConfig): this.type = {
 
     if (config.cloudProvider == "aws") {
 
       val auditLogPath = auditLogConfig.rawAuditPath
+      val auditLogFormat = auditLogConfig.auditLogFormat.toLowerCase.trim
       if (config.overwatchScope.contains(audit) && auditLogPath.isEmpty) {
         throw new BadConfigException("Audit cannot be in scope without the 'auditLogPath' being set. ")
       }
@@ -80,10 +108,16 @@ class Initializer(config: Config) extends SparkSessionWrapper {
             s"partitioned date folders in the format of ${auditLogPath.get}/date=. Received ${auditFolder} instead.")
         })
 
+      val supportedAuditLogFormats = Array("json", "parquet", "delta")
+      if (!supportedAuditLogFormats.contains(auditLogFormat)) {
+        throw new BadConfigException(s"Audit Log Format: Supported formats are ${supportedAuditLogFormats.mkString(",")} " +
+          s"but $auditLogFormat was placed in teh configuration. Please select a supported audit log format.")
+      }
+
       val finalAuditLogPath = if (auditLogPath.get.endsWith("/")) auditLogPath.get.dropRight(1) else auditLogPath.get
 
       config.setAuditLogConfig(
-        auditLogConfig.copy(rawAuditPath = Some(finalAuditLogPath), None)
+        auditLogConfig.copy(rawAuditPath = Some(finalAuditLogPath), auditLogFormat = auditLogFormat)
       )
 
     } else {
@@ -111,11 +145,7 @@ class Initializer(config: Config) extends SparkSessionWrapper {
         auditLogChk = Some(auditLogBronzeChk)
       )
 
-      config.setAuditLogConfig(
-        auditLogConfig.copy(
-          None, Some(ehFinalConfig)
-        )
-      )
+      config.setAuditLogConfig(auditLogConfig.copy(azureAuditLogEventhubConfig = Some(ehFinalConfig)))
 
     }
     this
@@ -125,10 +155,10 @@ class Initializer(config: Config) extends SparkSessionWrapper {
    * Convert the args brought in as JSON string into the paramters object "OverwatchParams".
    * Validate the config and the environment readiness for the run based on the configs and environment state
    *
-   * @param args JSON string of input args from input into main class.
+   * @param overwatchArgs JSON string of input args from input into main class.
    * @return
    */
-  private def validateAndRegisterArgs(args: Array[String]): this.type = {
+  private def validateAndRegisterArgs(overwatchArgs: String): this.type = {
 
     /**
      * Register custom deserializer to create OverwatchParams object
@@ -151,11 +181,12 @@ class Initializer(config: Config) extends SparkSessionWrapper {
      */
     val rawParams = if (config.isLocalTesting) {
       //      config.buildLocalOverwatchParams()
-      val synthArgs = config.buildLocalOverwatchParams()
-      mapper.readValue[OverwatchParams](synthArgs)
+//      val synthArgs = config.buildLocalOverwatchParams()
+//      mapper.readValue[OverwatchParams](synthArgs)
+      mapper.readValue[OverwatchParams](overwatchArgs)
     } else {
       logger.log(Level.INFO, "Validating Input Parameters")
-      mapper.readValue[OverwatchParams](args(0))
+      mapper.readValue[OverwatchParams](overwatchArgs)
     }
 
     // Now that the input parameters have been parsed -- set them in the config
@@ -166,7 +197,7 @@ class Initializer(config: Config) extends SparkSessionWrapper {
     val tokenSecret = rawParams.tokenSecret
     // TODO -- PRIORITY -- If data target is null -- default table gets dbfs:/null
     val dataTarget = rawParams.dataTarget.getOrElse(
-      DataTarget(Some("overwatch"), Some("dbfs:/user/hive/warehouse/overwatch.db")))
+      DataTarget(Some("overwatch"), Some("dbfs:/user/hive/warehouse/overwatch.db"), None))
     val auditLogConfig = rawParams.auditLogConfig
     val badRecordsPath = rawParams.badRecordsPath
 
@@ -199,16 +230,18 @@ class Initializer(config: Config) extends SparkSessionWrapper {
     // If data target is valid get db name and location and set it
     val dbName = dataTarget.databaseName.get
     val dbLocation = dataTarget.databaseLocation.getOrElse(s"dbfs:/user/hive/warehouse/${dbName}.db")
-    config.setDatabaseNameandLoc(dbName, dbLocation)
+    val dataLocation = dataTarget.etlDataPathPrefix.getOrElse(dbLocation)
+    config.setDatabaseNameAndLoc(dbName, dbLocation, dataLocation)
 
     val consumerDBName = dataTarget.consumerDatabaseName.getOrElse(dbName)
     val consumerDBLocation = dataTarget.consumerDatabaseLocation.getOrElse(s"/user/hive/warehouse/${consumerDBName}.db")
     config.setConsumerDatabaseNameandLoc(consumerDBName, consumerDBLocation)
 
     // Set Databricks Contract Prices from Config
-    // Defaulted to 0.56 interactive and 0.26 automated
     config.setContractInteractiveDBUPrice(rawParams.databricksContractPrices.interactiveDBUCostUSD)
     config.setContractAutomatedDBUPrice(rawParams.databricksContractPrices.automatedDBUCostUSD)
+    config.setContractSQLComputeDBUPrice(rawParams.databricksContractPrices.sqlComputeDBUCostUSD)
+    config.setContractJobsLightDBUPrice(rawParams.databricksContractPrices.jobsLightDBUCostUSD)
 
     // Set Primordial Date
     config.setPrimordialDateString(rawParams.primordialDateString)
@@ -220,6 +253,8 @@ class Initializer(config: Config) extends SparkSessionWrapper {
     config.setBadRecordsPath(badRecordsPath.getOrElse("/tmp/overwatch/badRecordsPath"))
 
     config.setMaxDays(rawParams.maxDaysToLoad)
+
+    config.setIntelligentScaling(validateIntelligentScaling(rawParams.intelligentScaling))
 
     this
   }
@@ -236,7 +271,10 @@ class Initializer(config: Config) extends SparkSessionWrapper {
   @throws(classOf[IllegalArgumentException])
   private def dataTargetIsValid(dataTarget: DataTarget): Boolean = {
     val dbName = dataTarget.databaseName.getOrElse("overwatch")
-    val dbLocation = dataTarget.databaseLocation.getOrElse(s"/user/hive/warehouse/${dbName}.db")
+    val rawDBLocation = dataTarget.databaseLocation.getOrElse(s"/user/hive/warehouse/${dbName}.db")
+    val dbLocation = PipelineFunctions.cleansePathURI(rawDBLocation)
+    val rawETLDataLocation = dataTarget.etlDataPathPrefix.getOrElse(dbLocation)
+    val etlDataLocation = PipelineFunctions.cleansePathURI(rawETLDataLocation)
     var switch = true
     if (spark.catalog.databaseExists(dbName)) {
       val dbMeta = spark.sessionState.catalog.getDatabaseMetadata(dbName)
@@ -245,7 +283,7 @@ class Initializer(config: Config) extends SparkSessionWrapper {
       if (existingDBLocation != dbLocation) {
         switch = false
         throw new BadConfigException(s"The DB: $dbName exists " +
-          s"at location $existingDBLocation which is different than the location entered in the config. Ensure" +
+          s"at location $existingDBLocation which is different than the location entered in the config. Ensure " +
           s"the DBName is unique and the locations match. The location must be a fully qualified URI such as " +
           s"dbfs:/...")
       }
@@ -256,26 +294,22 @@ class Initializer(config: Config) extends SparkSessionWrapper {
         throw new BadConfigException(s"The Database: $dbName was not created by overwatch. Specify a " +
           s"database name that does not exist or was created by Overwatch.")
       }
-      val overwatchSchemaVersion = dbProperties.getOrElse("SCHEMA", "BAD_SCHEMA")
-      if (overwatchSchemaVersion != config.overwatchSchemaVersion) {
-        switch = false
-        throw new BadConfigException(s"The overwatch DB Schema version is: $overwatchSchemaVersion but this" +
-          s" version of Overwatch requires ${config.overwatchSchemaVersion}. Upgrade Overwatch Schema to proceed " +
-          s"or drop existing database and allow Overwatch to recreate.")
-      }
     } else { // Database does not exist
-      try { // If the fs.ls below doesn't not throw a FileNotFound exception the target is not empty and will fail the run
-        dbutils.fs.ls(dbLocation)
+      if (!Helpers.pathExists(dbLocation)) { // db path does not already exist -- valid
+        logger.log(Level.INFO, s"Target location " +
+          s"is valid: will create database: $dbName at location: ${dbLocation}")
+      } else { // db does not exist AND path already exists
         switch = false
-        throw new BadConfigException(s"The target database location: ${dbLocation} " +
-          s"already exists but does not appear to be associated with the Overwatch database name, $dbName " +
-          s"specified. Specify a path that doesn't already exist or choose an existing overwatch database AND " +
-          s"database its associated location.")
-      } catch { // If the fs.ls throws fileNotFound exception, the db target does not exist and the db will be created
-        case e: java.io.FileNotFoundException => logger.log(Level.INFO, s"Target location " +
-          s"is valid: will create database: $dbName at location: ${dbLocation}", e)
+        throw new BadConfigException(
+          s"""The target database location: ${dbLocation}
+          already exists. Please specify a path that doesn't yet exist. If attempting to launch Overwatch on a secondary
+          workspace, please choose a unique location for the database on this workspace and use the "etlDataPathPrefix"
+          to reference the shared physical data location.""".stripMargin)
       }
     }
+
+    if (Helpers.pathExists(etlDataLocation)) println(s"\n\nWARNING!! The ETL Data Prefix exists. Verify that only " +
+      s"Overwatch data exists in this path.")
 
     // todo - refactor away duplicity
     /**
@@ -285,12 +319,13 @@ class Initializer(config: Config) extends SparkSessionWrapper {
      * to remove duplicity while still enabling control between which checks are done for which DataTarget.
      */
     val consumerDBName = dataTarget.consumerDatabaseName.getOrElse(dbName)
-    val consumerDBLocation = dataTarget.consumerDatabaseLocation.getOrElse(s"/user/hive/warehouse/${consumerDBName}.db")
+    val rawConsumerDBLocation = dataTarget.consumerDatabaseLocation.getOrElse(s"/user/hive/warehouse/${consumerDBName}.db")
+    val consumerDBLocation = PipelineFunctions.cleansePathURI(rawConsumerDBLocation)
     if (consumerDBName != dbName) { // separate consumer db
       if (spark.catalog.databaseExists(consumerDBName)) {
         val consumerDBMeta = spark.sessionState.catalog.getDatabaseMetadata(consumerDBName)
         val existingConsumerDBLocation = consumerDBMeta.locationUri.toString
-        if (existingConsumerDBLocation != consumerDBLocation) {
+        if (existingConsumerDBLocation != consumerDBLocation) { // separated consumer DB but same location FAIL
           switch = false
           throw new BadConfigException(s"The Consumer DB: $consumerDBName exists" +
             s"at location $existingConsumerDBLocation which is different than the location entered in the config. Ensure" +
@@ -298,25 +333,24 @@ class Initializer(config: Config) extends SparkSessionWrapper {
             s"dbfs:/...")
         }
       } else { // consumer DB is different from ETL DB AND db does not exist
-        try { // If the fs.ls below doesn't not throw a FileNotFound exception the target is not empty and will fail the run
-          dbutils.fs.ls(consumerDBLocation)
+        if (!Helpers.pathExists(consumerDBLocation)) { // consumer db path is empty
+          logger.log(Level.INFO, s"Consumer DB location " +
+            s"is valid: will create database: $consumerDBName at location: ${consumerDBLocation}")
+        } else {
           switch = false
-          throw new BadConfigException(s"The target database location: ${consumerDBLocation} " +
-            s"already exists but does not appear to be associated with the Overwatch database name, $consumerDBName " +
-            s"specified. Specify a path that doesn't already exist or choose an existing overwatch database AND " +
-            s"database its associated location.")
-        } catch { // If the fs.ls throws fileNotFound exception, the db target does not exist and the db will be created
-          case e: java.io.FileNotFoundException => logger.log(Level.INFO, s"Target location " +
-            s"is valid: will create database: $consumerDBName at location: ${consumerDBLocation}", e)
+          throw new BadConfigException(
+            s"""The consumer database location: ${dbLocation}
+          already exists. Please specify a path that doesn't yet exist. If attempting to launch Overwatch on a secondary
+          workspace, please choose a unique location for the database on this workspace.""".stripMargin)
         }
       }
 
-      if (consumerDBLocation == dbLocation) { // separate db AND same location ERROR
+      if (consumerDBLocation == dbLocation && consumerDBName != dbName) { // separate db AND same location ERROR
         switch = false
         throw new BadConfigException("Consumer DB Name cannot differ from ETL DB Name while having the same location.")
       }
     } else { // same consumer db as etl db
-      if (consumerDBLocation != dbLocation) { // same db AND DIFFERENT location ERROR
+      if (consumerDBName == dbName && consumerDBLocation != dbLocation) { // same db AND DIFFERENT location ERROR
         switch = false
         throw new BadConfigException("Consumer DB cannot match ETL DB Name while having different locations.")
       }
@@ -390,6 +424,25 @@ object Initializer extends SparkSessionWrapper {
   // Init the SparkSessionWrapper with envVars
   envInit()
 
+  private def initConfigState(debugFlag: Boolean): Config = {
+    logger.log(Level.INFO, "Initializing Config")
+    val config = new Config()
+    val orgId = if (config.isLocalTesting) System.getenv("ORGID") else {
+      if (dbutils.notebook.getContext.tags("orgId") == "0") {
+        dbutils.notebook.getContext.apiUrl.get.split("\\.")(0).split("/").last
+      } else dbutils.notebook.getContext.tags("orgId")
+    }
+    config.setOrganizationId(orgId)
+    config.registerInitialSparkConf(spark.conf.getAll)
+    config.setInitialWorkerCount(getNumberOfWorkerNodes)
+    config.setInitialShuffleParts(spark.conf.get("spark.sql.shuffle.partitions").toInt)
+    if (debugFlag) {
+      envInit("DEBUG")
+      config.setDebugFlag(debugFlag)
+    }
+    config
+  }
+
   /**
    * Companion object to validate environment initialize the config for the run.
    * Takes input of raw arg strings into the main class, parses and validates them,
@@ -397,7 +450,7 @@ object Initializer extends SparkSessionWrapper {
    * and checks for avoidable issues. The initializer is also responsible for identifying any errors in the
    * configuration that can be identified before the runs begins to enable fail fast.
    *
-   * @param args      Json string of args -- When passing into args in Databricks job UI, the json string must
+   * @param overwatchArgs      Json string of args -- When passing into args in Databricks job UI, the json string must
    *                  be passed in as an escaped Json String. Use JsonUtils in Tools to build and extract the string
    *                  to be used here.
    * @param debugFlag manual Boolean setter to enable the debug flag. This is different than the log4j DEBUG Level
@@ -405,22 +458,14 @@ object Initializer extends SparkSessionWrapper {
    *                  is more robust output when debug is enabled.
    * @return
    */
-  def apply(args: Array[String], debugFlag: Boolean = false): Workspace = {
+  def apply(overwatchArgs: String, debugFlag: Boolean = false): Workspace = {
 
-    logger.log(Level.INFO, "Initializing Config")
-    val config = new Config()
-    config.setOrganizationId(dbutils.notebook.getContext.tags("orgId"))
-    config.registerInitialSparkConf(spark.conf.getAll)
-    config.setInitialShuffleParts(spark.conf.get("spark.sql.shuffle.partitions").toInt)
-    if (debugFlag) {
-      envInit("DEBUG")
-      config.setDebugFlag(debugFlag)
-    }
+    val config = initConfigState(debugFlag)
 
     logger.log(Level.INFO, "Initializing Environment")
     val initializer = new Initializer(config)
     val database = initializer
-      .validateAndRegisterArgs(args)
+      .validateAndRegisterArgs(overwatchArgs)
       .initializeDatabase()
 
     logger.log(Level.INFO, "Initializing Workspace")
@@ -429,5 +474,25 @@ object Initializer extends SparkSessionWrapper {
 
     workspace
   }
+
+  private[overwatch] def apply(overwatchArgs: String, debugFlag: Boolean, isSnap: Boolean): Workspace = {
+
+    val config = initConfigState(debugFlag)
+
+    logger.log(Level.INFO, "Initializing Environment")
+    val initializer = new Initializer(config)
+    val database = initializer
+      .setIsSnap(isSnap)
+      .validateAndRegisterArgs(overwatchArgs)
+      .initializeDatabase()
+
+    logger.log(Level.INFO, "Initializing Workspace")
+    val workspace = Workspace(database, config)
+
+
+    workspace
+  }
+
+
 }
 

@@ -1,6 +1,6 @@
 package com.databricks.labs.overwatch
 
-import com.databricks.labs.overwatch.utils.{ApiCallFailure, ApiEnv, Config, JsonUtils, NoNewDataException, SchemaTools, SparkSessionWrapper, TokenError}
+import com.databricks.labs.overwatch.utils._
 import com.fasterxml.jackson.databind.JsonMappingException
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.sql.DataFrame
@@ -25,16 +25,35 @@ class ApiCall(env: ApiEnv) extends SparkSessionWrapper {
   private var _maxResults: Int = _
   private var _status: String = "SUCCESS"
   private var _errorFlag: Boolean = false
+  private var _allowUnsafeSSL: Boolean = false
+
   private val mapper = JsonUtils.defaultObjectMapper
+  private val httpHeaders = Seq[(String, String)](
+    ("Content-Type", "application/json"),
+    ("Charset",  "UTF-8"),
+    ("User-Agent",  s"databricks-labs-overwatch-${env.packageVersion}"),
+    ("Authorization", s"Bearer ${env.rawToken}")
+  )
+
+  private def allowUnsafeSSL = _allowUnsafeSSL
+  private def reqOptions: Seq[HttpOptions.HttpOption] = {
+    val baseOptions = Seq(
+      HttpOptions.connTimeout(ApiCall.connTimeoutMS),
+      HttpOptions.connTimeout(ApiCall.readTimeoutMS)
+    )
+    if (allowUnsafeSSL) baseOptions :+ HttpOptions.allowUnsafeSSL else baseOptions
+
+  }
 
   private def setQuery(value: Option[Map[String, Any]]): this.type = {
-    if (value.nonEmpty) {
+    if (value.nonEmpty && _paginate) {
       _limit = value.get.getOrElse("limit", 150).toString.toInt
       _initialQueryMap = value.get + ("limit" -> _limit) + ("offset" -> value.get.getOrElse("offset", 0))
-    } else {
+    } else if (_paginate) {
       _limit = 150
       _initialQueryMap = Map("limit" -> _limit, "offset" -> 0)
-    }
+    } else _initialQueryMap = value.getOrElse(Map[String, Any]())
+    _limit = _initialQueryMap.getOrElse("limit", 150).toString.toInt
     _jsonQuery = JsonUtils.objToJson(_initialQueryMap).compactString
     _getQueryString = "?" + _initialQueryMap.map { case(k, v) => s"$k=$v"}.mkString("&")
     this
@@ -83,25 +102,24 @@ class ApiCall(env: ApiEnv) extends SparkSessionWrapper {
   def asStrings: Array[String] = results.toArray
 
   def asDF: DataFrame = {
-    val apiDF = try {
-      if (dataCol == "*") spark.read.json(Seq(results: _*).toDS)
-      else spark.read.json(Seq(results: _*).toDS).select(explode(col(dataCol)).alias(dataCol))
+    try {
+      val apiResultDF = spark.read.json(Seq(results: _*).toDS)
+      if (dataCol == "*") apiResultDF
+      else apiResultDF.select(explode(col(dataCol)).alias(dataCol))
         .select(col(s"$dataCol.*"))
     } catch {
       case e: Throwable =>
-        val emptyDF = sc.parallelize(Seq("")).toDF()
         if (results.isEmpty) {
           val msg = s"No data returned for api endpoint ${_apiName}"
           setStatus(msg, Level.INFO, Some(e))
-          emptyDF
+          spark.emptyDataFrame
         }
         else {
           val msg = s"Acquiring data from ${_apiName} failed."
           setStatus(msg, Level.ERROR, Some(e))
-          emptyDF
+          spark.emptyDataFrame
         }
     }
-    SchemaTools.scrubSchema(apiDF)
   }
 
   private def dataCol: String = {
@@ -131,16 +149,23 @@ class ApiCall(env: ApiEnv) extends SparkSessionWrapper {
   def executeGet(pageCall: Boolean = false): this.type = {
     logger.log(Level.INFO, s"Loading $req -> query: $getQueryString")
     try {
-      val result = Http(req + getQueryString)
-        .headers(Map[String, String](
-          "Content-Type" -> "application/json",
-          "Charset"-> "UTF-8",
-          "User-Agent" -> s"databricks-labs-overwatch/${env.packageVersion}",
-          "Authorization" -> s"Bearer ${env.rawToken}"
-        ))
-        .option(HttpOptions.connTimeout(ApiCall.connTimeoutMS))
-        .option(HttpOptions.readTimeout(ApiCall.readTimeoutMS))
-        .asString
+      val result = try {
+        Http(req + getQueryString)
+          .copy(headers = httpHeaders)
+          .options(reqOptions)
+          .asString
+      } catch {
+        case _: javax.net.ssl.SSLHandshakeException => // for PVC with ssl errors
+          val sslMSG = "ALERT: DROPPING BACK TO UNSAFE SSL: SSL handshake errors were detected, allowing unsafe " +
+            "ssl. If this is unexpected behavior, validate your ssl certs."
+          logger.log(Level.WARN, sslMSG)
+          println(sslMSG)
+          _allowUnsafeSSL = true
+          Http(req + getQueryString)
+            .copy(headers = httpHeaders)
+            .options(reqOptions)
+            .asString
+      }
       if (result.isError) {
         if (result.code == 429) {
           Thread.sleep(2000)
@@ -153,10 +178,10 @@ class ApiCall(env: ApiEnv) extends SparkSessionWrapper {
           throw new ApiCallFailure(s"${_apiName} could not execute: ${result.code}")
         }
       }
-      if (!pageCall) {
+      if (!pageCall && _paginate) {
         // Append initial results
         results.append(mapper.writeValueAsString(mapper.readTree(result.body)))
-        if (_paginate) paginate()
+        paginate()
       } else {
         results.append(mapper.writeValueAsString(mapper.readTree(result.body)))
       }
@@ -213,28 +238,36 @@ class ApiCall(env: ApiEnv) extends SparkSessionWrapper {
     val jsonQuery = JsonUtils.objToJson(_initialQueryMap).compactString
     logger.log(Level.INFO, s"Loading $req -> query: $jsonQuery")
     try {
-      val result = Http(req)
-        .postData(jsonQuery)
-        .headers(Map[String, String](
-          "Content-Type" -> "application/json",
-          "Charset"-> "UTF-8",
-          "User-Agent" -> s"databricks-labs-overwatch/${env.packageVersion}",
-          "Authorization" -> s"Bearer ${env.rawToken}"
-        ))
-        .option(HttpOptions.connTimeout(ApiCall.connTimeoutMS))
-        .option(HttpOptions.readTimeout(ApiCall.readTimeoutMS))
-        .asString
+      val result = try {
+        Http(req)
+          .copy(headers = httpHeaders)
+          .postData(jsonQuery)
+          .options(reqOptions)
+          .asString
+      } catch {
+        case _: javax.net.ssl.SSLHandshakeException => // for PVC with ssl errors
+          val sslMSG = "ALERT: DROPPING BACK TO UNSAFE SSL: SSL handshake errors were detected, allowing unsafe " +
+            "ssl. If this is unexpected behavior, validate your ssl certs."
+          logger.log(Level.WARN, sslMSG)
+          println(sslMSG)
+          _allowUnsafeSSL = true
+          Http(req)
+            .copy(headers = httpHeaders)
+            .postData(jsonQuery)
+            .options(reqOptions)
+            .asString
+      }
       if (result.isError) {
         val err = mapper.readTree(result.body).get("error_code").asText()
         val msg = mapper.readTree(result.body).get("message").asText()
         setStatus(s"$err -> $msg", Level.WARN)
         throw new ApiCallFailure(s"$err -> $msg")
       }
-      if (!pageCall) {
+      if (!pageCall && _paginate) {
         val jsonResult = mapper.writeValueAsString(mapper.readTree(result.body))
         val totalCount = mapper.readTree(result.body).get("total_count").asInt(0)
         if (totalCount > 0) results.append(jsonResult)
-        if (totalCount > limit && _paginate) paginate(totalCount)
+        if (totalCount > limit) paginate(totalCount)
       } else {
         results.append(mapper.writeValueAsString(mapper.readTree(result.body)))
       }

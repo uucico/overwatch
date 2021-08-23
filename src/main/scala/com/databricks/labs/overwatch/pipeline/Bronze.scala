@@ -11,6 +11,7 @@ class Bronze(_workspace: Workspace, _database: Database, _config: Config)
 
   /**
    * Enable access to Bronze pipeline tables externally.
+   *
    * @return
    */
   def getAllTargets: Array[PipelineTable] = {
@@ -29,27 +30,28 @@ class Bronze(_workspace: Workspace, _database: Database, _config: Config)
 
   private val logger: Logger = Logger.getLogger(this.getClass)
 
-  lazy private val jobsSnapshotModule = Module(1001, "Bronze_Jobs_Snapshot", this)
+  lazy private[overwatch] val jobsSnapshotModule = Module(1001, "Bronze_Jobs_Snapshot", this)
   lazy private val appendJobsProcess = ETLDefinition(
     workspace.getJobsDF,
+    Seq(cleanseRawJobsSnapDF(config.cloudProvider)),
     append(BronzeTargets.jobsSnapshotTarget)
   )
 
-  lazy private val clustersSnapshotModule = Module(1002, "Bronze_Clusters_Snapshot", this)
+  lazy private[overwatch] val clustersSnapshotModule = Module(1002, "Bronze_Clusters_Snapshot", this)
   lazy private val appendClustersAPIProcess = ETLDefinition(
     workspace.getClustersDF,
     Seq(cleanseRawClusterSnapDF(config.cloudProvider)),
     append(BronzeTargets.clustersSnapshotTarget)
   )
 
-  lazy private val poolsSnapshotModule = Module(1003, "Bronze_Pools", this)
+  lazy private[overwatch] val poolsSnapshotModule = Module(1003, "Bronze_Pools", this)
   lazy private val appendPoolsProcess = ETLDefinition(
     workspace.getPoolsDF,
     Seq(cleanseRawPoolsDF()),
     append(BronzeTargets.poolsTarget)
   )
 
-  lazy private val auditLogsModule = Module(1004, "Bronze_AuditLogs", this)
+  lazy private[overwatch] val auditLogsModule = Module(1004, "Bronze_AuditLogs", this)
   lazy private val appendAuditLogsProcess = ETLDefinition(
     getAuditLogsDF(
       config.auditLogConfig,
@@ -63,28 +65,33 @@ class Bronze(_workspace: Workspace, _database: Database, _config: Config)
     append(BronzeTargets.auditLogsTarget)
   )
 
-  lazy private val clusterEventLogsModule = Module(1005, "Bronze_ClusterEventLogs", this, Array(1004))
+  lazy private[overwatch] val clusterEventLogsModule = Module(1005, "Bronze_ClusterEventLogs", this, Array(1004), 0.0, Some(30))
   lazy private val appendClusterEventLogsProcess = ETLDefinition(
-    prepClusterEventLogs(
-      BronzeTargets.auditLogsTarget.asIncrementalDF(clusterEventLogsModule, auditLogsIncrementalCols),
-      BronzeTargets.clustersSnapshotTarget,
-      clusterEventLogsModule.fromTime,
-      clusterEventLogsModule.untilTime,
-      config.apiEnv,
-      config.organizationId
+    BronzeTargets.clustersSnapshotTarget.asDF,
+    Seq(
+      prepClusterEventLogs(
+        BronzeTargets.auditLogsTarget.asIncrementalDF(clusterEventLogsModule, auditLogsIncrementalCols),
+        clusterEventLogsModule.fromTime,
+        clusterEventLogsModule.untilTime,
+        config.apiEnv,
+        config.organizationId
+      )
     ),
     append(BronzeTargets.clusterEventsTarget)
   )
 
-  lazy private val sparkEventLogsModule = Module(1006, "Bronze_SparkEventLogs", this, Array(1004))
+  lazy private val sparkLogClusterScaleCoefficient = 2.4
+  lazy private[overwatch] val sparkEventLogsModule = Module(1006, "Bronze_SparkEventLogs", this, Array(1004), sparkLogClusterScaleCoefficient)
   lazy private val appendSparkEventLogsProcess = ETLDefinition(
     BronzeTargets.auditLogsTarget.asIncrementalDF(sparkEventLogsModule, auditLogsIncrementalCols),
     Seq(
       collectEventLogPaths(
         sparkEventLogsModule.fromTime,
         sparkEventLogsModule.untilTime,
+        config.cloudProvider,
         BronzeTargets.auditLogsTarget.asIncrementalDF(sparkEventLogsModule, auditLogsIncrementalCols, 30),
-        BronzeTargets.clustersSnapshotTarget
+        BronzeTargets.clustersSnapshotTarget,
+        sparkLogClusterScaleCoefficient
       ),
       generateEventLogsDF(
         database,
@@ -100,9 +107,12 @@ class Bronze(_workspace: Workspace, _database: Database, _config: Config)
 
   // TODO -- convert and merge this into audit's ETLDefinition
   private def landAzureAuditEvents(): Unit = {
+    val isFirstAuditRun = !BronzeTargets.auditLogsTarget.exists
     val rawAzureAuditEvents = landAzureAuditLogDF(
+      BronzeTargets.auditLogAzureLandRaw,
       config.auditLogConfig.azureAuditLogEventhubConfig.get,
-      config.isFirstRun,
+      config.etlDataPathPrefix, config.databaseLocation, config.consumerDatabaseLocation,
+      isFirstAuditRun,
       config.organizationId,
       config.runID
     )
@@ -113,7 +123,7 @@ class Bronze(_workspace: Workspace, _database: Database, _config: Config)
       spark, config, "azure_audit_log_preProcessing", getTotalCores
     )
 
-    database.write(optimizedAzureAuditEvents, BronzeTargets.auditLogAzureLandRaw,pipelineSnapTime.asColumnTS)
+    database.write(optimizedAzureAuditEvents, BronzeTargets.auditLogAzureLandRaw, pipelineSnapTime.asColumnTS)
 
     val rawProcessCompleteMsg = "Azure audit ingest process complete"
     if (config.debugFlag) println(rawProcessCompleteMsg)
@@ -156,6 +166,24 @@ object Bronze {
     new Bronze(workspace, workspace.database, workspace.getConfig)
       .initPipelineRun()
       .loadStaticDatasets()
+  }
+
+  private[overwatch] def apply(
+                                workspace: Workspace,
+                                readOnly: Boolean = false,
+                                suppressReport: Boolean = false,
+                                suppressStaticDatasets: Boolean = false
+                              ): Bronze = {
+    val bronzePipeline = new Bronze(workspace, workspace.database, workspace.getConfig)
+      .setReadOnly(readOnly)
+      .suppressRangeReport(suppressReport)
+      .initPipelineRun()
+
+    if (suppressStaticDatasets) {
+      bronzePipeline
+    } else {
+      bronzePipeline.loadStaticDatasets()
+    }
   }
 
 }

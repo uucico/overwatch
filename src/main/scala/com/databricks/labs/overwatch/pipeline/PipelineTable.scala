@@ -5,6 +5,7 @@ import com.databricks.labs.overwatch.utils.Frequency.Frequency
 import com.databricks.labs.overwatch.utils._
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{AnalysisException, DataFrame}
@@ -14,7 +15,7 @@ import org.apache.spark.sql.{AnalysisException, DataFrame}
 //  Perhaps add the strategy into the Rule definition in the Rules Engine
 case class PipelineTable(
                           name: String,
-                          keys: Array[String],
+                          private val _keys: Array[String],
                           config: Config,
                           incrementalColumns: Array[String] = Array(),
                           dataFrequency: Frequency = Frequency.milliSecond,
@@ -40,24 +41,12 @@ case class PipelineTable(
 
   private val logger: Logger = Logger.getLogger(this.getClass)
   private var currentSparkOverrides: Map[String, String] = sparkOverrides
+  logger.log(Level.INFO, s"Spark Overrides Initialized for target: ${_databaseName}.${name} to\n${currentSparkOverrides.mkString(", ")}")
 
   import spark.implicits._
 
-  val databaseName: String = if (_databaseName == "default") config.databaseName else config.consumerDatabaseName
-
+  val databaseName: String = if (_databaseName == "default") config.databaseName else _databaseName
   val tableFullName: String = s"${databaseName}.${name}"
-
-  if (autoOptimize) {
-    spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite", "true")
-    println(s"Setting Auto Optimize for ${name}")
-  }
-  else spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite", "false")
-
-  if (autoCompact) {
-    spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact", "true")
-    println(s"Setting Auto Compact for ${name}")
-  }
-  else spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact", "false")
 
   // Minimum Schema Enforcement Management
   private var withMasterMinimumSchema: Boolean = if (masterSchema.nonEmpty) true else false
@@ -88,17 +77,63 @@ case class PipelineTable(
    *
    * @param updates spark conf updates
    */
-  private[overwatch] def setSparkOverrides(updates: Map[String, String] = Map()): Unit = {
+  private[overwatch] def applySparkOverrides(updates: Map[String, String] = Map()): Unit = {
+
+    if (autoOptimize) {
+      logger.log(Level.INFO, s"enabling optimizeWrite on $tableFullName")
+      spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite", "true")
+      if (config.debugFlag) println(s"Setting Auto Optimize for ${name}")
+    }
+    else spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite", "false")
+
+    if (autoCompact) {
+      logger.log(Level.INFO, s"enabling autoCompact on $tableFullName")
+      spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact", "true")
+      if (config.debugFlag) println(s"Setting Auto Compact for ${name}")
+    }
+    else spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact", "false")
+
     if (updates.nonEmpty) {
       currentSparkOverrides = currentSparkOverrides ++ updates
     }
-    if (sparkOverrides.nonEmpty && updates.isEmpty) {
+
+    if (currentSparkOverrides.nonEmpty) {
       PipelineFunctions.setSparkOverrides(spark, currentSparkOverrides, config.debugFlag)
+    } else {
+      logger.log(Level.INFO, s"USING spark conf defaults for $tableFullName")
     }
   }
 
+  def tableIdentifier: Option[TableIdentifier] = {
+    val matchingTables = spark.sessionState.catalog.listTables(databaseName, name)
+    if (matchingTables.length > 1) {
+      throw new Exception(s"MULTIPLE TABLES MATCHED: $tableFullName")
+    } else matchingTables.headOption
+  }
+
+  def catalogTable: CatalogTable = {
+    if (tableIdentifier.nonEmpty) {
+      spark.sessionState.catalog.getTableMetadata(tableIdentifier.get)
+    } else {
+      throw new Exception(s"TARGET TABLE NOT FOUND: $tableFullName")
+    }
+  }
+//  val isManaged = tblMeta.tableType.name == "MANAGED"
+//  val tblStoragePath = tblMeta.location.toString
+//  DeltaTable.forName(tableFullName).
+  val tableLocation: String = s"${config.etlDataPathPrefix}/$name".toLowerCase
+
   def exists: Boolean = {
     spark.catalog.tableExists(tableFullName)
+  }
+
+  def keys: Array[String] = keys()
+  def keys(withOveratchMeta: Boolean = false): Array[String] = {
+    if (withOveratchMeta) {
+      (_keys :+ "organization_id") ++ Array("Overwatch_RunID", "Pipeline_SnapTS")
+    } else {
+      _keys :+ "organization_id"
+    }
   }
 
   def asDF: DataFrame = {
@@ -113,7 +148,7 @@ case class PipelineTable(
           spark.table(tableFullName).verifyMinimumSchema(masterSchema, enforceNonNullable, config.debugFlag)
         } else spark.table(tableFullName)
         if (withGlobalFilters && config.globalFilters.nonEmpty)
-          PipelineFunctions.applyFilters(fullDF, config.globalFilters)
+          PipelineFunctions.applyFilters(fullDF, config.globalFilters, config.debugFlag)
         else fullDF
       } else spark.emptyDataFrame
     } catch {
@@ -134,9 +169,23 @@ case class PipelineTable(
     asIncrementalDF(module, cronColumns, additionalLagDays)
   }
 
+  private def casedCompare(s1: String, s2: String): Boolean = {
+    if ( // make lower case if column names are case insensitive
+      spark.conf.getOption("spark.sql.caseSensitive").getOrElse("false").toBoolean
+    ) s1 == s2 else s1.equalsIgnoreCase(s2)
+  }
+
+  private def casedSeqCompare(seq1: Seq[String], s2: String): Boolean = {
+    if ( // make lower case if column names are case insensitive
+      spark.conf.getOption("spark.sql.caseSensitive").getOrElse("false").toBoolean
+    ) seq1.contains(s2) else seq1.exists(s1 => s1.equalsIgnoreCase(s2))
+  }
+
   /**
    * Build 1 or more incremental filters for a dataframe from standard start or aditionalStart less
    * "additionalLagDays" when loading an incremental DF with some front-padding to capture lagging start events
+   * IMPORTANT: This logic is insufficient for date only filters. Date filters are meant to also be partition filters
+   * coupled with a more granular filter. Date filters are inclusive on both sides for paritioning.
    *
    * @param module            module used for logging and capturing status timestamps by module
    * @param additionalLagDays Front-padded days prior to start
@@ -146,7 +195,7 @@ case class PipelineTable(
   def asIncrementalDF(
                        module: Module,
                        cronColumnsNames: Seq[String],
-                       additionalLagDays: Int = 0
+                       additionalLagDays: Long = 0
                      ): DataFrame = {
     val moduleId = module.moduleId
     val moduleName = module.moduleName
@@ -158,21 +207,38 @@ case class PipelineTable(
         spark.table(tableFullName).verifyMinimumSchema(masterSchema,enforceNonNullable, config.debugFlag)
       } else spark.table(tableFullName)
       val dfFields = instanceDF.schema.fields
-      val cronCols = dfFields.filter(f => cronColumnsNames.contains(f.name))
+      val cronFields = dfFields.filter(f => casedSeqCompare(cronColumnsNames, f.name))
 
       if (additionalLagDays > 0) require(
         dfFields.map(_.dataType).contains(DateType) || dfFields.map(_.dataType).contains(TimestampType),
         "additional lag days cannot be used without at least one DateType or TimestampType column in the filterArray")
-      val incrementalFilters = cronColumnsNames.map(filterCol => {
 
-        val field = cronCols.filter(_.name == filterCol).head
+      val filterMsg = s"FILTERING: ${module.moduleName} using cron columns: ${cronFields.map(_.name).mkString(", ")}"
+      logger.log(Level.INFO, filterMsg)
+      if (config.debugFlag) println(filterMsg)
+      val incrementalFilters = cronFields.map(field => {
 
         field.dataType match {
           case dt: DateType => {
+            if (!partitionBy.map(_.toLowerCase).contains(field.name.toLowerCase)) {
+              val errmsg = s"Date filters are inclusive on both sides and are used for partitioning. Date filters " +
+                s"should not be used in the Overwatch package alone. Date filters must be accompanied by a more " +
+                s"granular filter to utilize df.asIncrementalDF.\nERROR: ${field.name} not in partition columns: " +
+                s"${partitionBy.mkString(", ")}"
+              throw new IncompleteFilterException(errmsg)
+            }
+            // If Overwatch runs > 1X / day the date filter must be inclusive or filter will omit all data since
+            // the following cannot be true
+            // date >= today && date < today
+            // The above right-side exclusive filter is created from the filter generator thus one tick must be
+            // added to the right (end) date
+            val untilDate = if (module.fromTime.asLocalDateTime.toLocalDate == module.untilTime.asLocalDateTime.toLocalDate) {
+              PipelineFunctions.addNTicks(module.untilTime.asColumnTS, 1, DateType)
+            } else module.untilTime.asColumnTS
             IncrementalFilter(
-              field.name,
-              date_sub(module.fromTime.asColumnTS.cast(dt), additionalLagDays),
-              module.untilTime.asColumnTS.cast(dt)
+              field,
+              date_sub(module.fromTime.asColumnTS.cast(dt), additionalLagDays.toInt),
+              untilDate.cast(dt)
             )
           }
           case dt: TimestampType => {
@@ -183,14 +249,20 @@ case class PipelineTable(
               module.fromTime.asColumnTS
             }
             IncrementalFilter(
-              field.name,
+              field,
               start,
               module.untilTime.asColumnTS
             )
           }
-          case _: LongType => {
-            IncrementalFilter(field.name,
-              lit(module.fromTime.asUnixTimeMilli),
+          case dt: LongType => {
+            val start = if (additionalLagDays > 0) {
+              lit(module.fromTime.asUnixTimeMilli - (additionalLagDays * 24 * 60 * 60 * 1000)).cast(dt)
+            } else {
+              lit(module.fromTime.asUnixTimeMilli)
+            }
+            IncrementalFilter(
+              field,
+              start,
               lit(module.untilTime.asUnixTimeMilli)
             )
           }
@@ -199,20 +271,20 @@ case class PipelineTable(
         }
       })
 
-      PipelineFunctions.withIncrementalFilters(instanceDF, module, incrementalFilters, config.globalFilters, dataFrequency)
+      PipelineFunctions.withIncrementalFilters(
+        instanceDF, Some(module), incrementalFilters, config.globalFilters, dataFrequency, config.debugFlag
+      )
     } else { // Source doesn't exist
       spark.emptyDataFrame
     }
   }
 
   def writer(df: DataFrame): Any = {
-    setSparkOverrides()
-    val f = if (config.isLocalTesting && !config.isDBConnect) "parquet" else format
     if (checkpointPath.nonEmpty) {
       val streamWriterMessage = s"DEBUG: PipelineTable - Checkpoint for ${tableFullName} == ${checkpointPath.get}"
       if (config.debugFlag) println(streamWriterMessage)
       logger.log(Level.INFO, streamWriterMessage)
-      var streamWriter = df.writeStream.outputMode(mode).format(f).option("checkpointLocation", checkpointPath.get)
+      var streamWriter = df.writeStream.outputMode(mode).format(format).option("checkpointLocation", checkpointPath.get)
         .queryName(s"StreamTo_${name}")
       streamWriter = if (partitionBy.nonEmpty) streamWriter.partitionBy(partitionBy: _*) else streamWriter
       streamWriter = if (mode == "overwrite") streamWriter.option("overwriteSchema", "true")
@@ -222,7 +294,7 @@ case class PipelineTable(
       else streamWriter
       streamWriter
     } else {
-      var dfWriter = df.write.mode(mode).format(f)
+      var dfWriter = df.write.mode(mode).format(format)
       dfWriter = if (partitionBy.nonEmpty) dfWriter.partitionBy(partitionBy: _*) else dfWriter
       dfWriter = if (mode == "overwrite") dfWriter.option("overwriteSchema", "true")
       else if (enableSchemaMerge && mode != "overwrite")
